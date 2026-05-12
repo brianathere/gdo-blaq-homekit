@@ -25,14 +25,14 @@ jobs:
     - name: Build and Generate Combined Firmware
       uses: espressif/esp-idf-ci-action@v1
       with:
-        esp_idf_version: v5.4.1
+        esp_idf_version: v6.0.1
         target: esp32s3
         path: '.'
         command: |
           idf.py build
-          esptool.py --chip esp32s3 merge_bin \
+          esptool --chip esp32s3 merge-bin \
             -o build/konnected-gdo-blaq-homekit.bin \
-            --flash_mode dio --flash_size 4MB --flash_freq 80m \
+            --flash-mode dio --flash-size 4MB --flash-freq 80m \
             0x0 build/bootloader/bootloader.bin \
             0x8000 build/partition_table/partition-table.bin \
             0x10000 build/gdo-blaq-homekit.bin

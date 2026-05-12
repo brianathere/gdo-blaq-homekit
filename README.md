@@ -16,3 +16,19 @@
  The `nvs_wifi_connect` component will start an HTTP server for configuration if the device is not connected to a WiFi network. Connect to the access point created by the device with SSID `konnected-blaq-hk` and open a web browser to `http://192.168.4.1` and enter your WiFi credentials, then click `Write and Reboot`.
 
  After connecting to WiFi and restarting wait about 10 seconds then open the Home app on your iOS device to add the accessory. Go to "Add Accessory" and then "more options..." to find the accessory on the network. Click on the found accessory and enter the setup code `251-02-023` when prompted and follow the instructions to complete the setup.
+
+## Hardware Smoke Test
+
+The host-side smoke test can build, flash, monitor serial boot logs, and verify the default provisioning path:
+
+```sh
+. /Users/brianmeek/scratch/esp-idf-v6.0.1/export.sh
+python tests/hardware_smoke.py \
+  --port /dev/cu.usbmodemXXXX \
+  --build \
+  --flash \
+  --erase-flash \
+  --expect-wifi ap
+```
+
+`--erase-flash` clears NVS and HomeKit pairing data. Omit it when testing an already-provisioned device, and use `--expect-wifi sta` if Wi-Fi credentials are already stored.
