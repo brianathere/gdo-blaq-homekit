@@ -23,7 +23,7 @@ Before changing files, classify the task:
 - Build system: ESP-IDF CMake via root `CMakeLists.txt` and `main/CMakeLists.txt`.
 - CI: `.github/workflows/build.yml` builds with `espressif/esp-idf-ci-action@v1`, merges a combined firmware image, uploads artifacts, and on releases uploads to GitHub Releases/S3 and generates an esp-web-tools manifest.
 - Validated local build baseline: `idf.py build`, `idf.py size`, and the CI `esptool merge-bin` command completed with ESP-IDF `v6.0.1`.
-- Baseline app image size from that build: `0x102200` bytes, with `0x74e00` bytes free in the `0x177000` app partition. IRAM was full: `16384 / 16384` bytes used.
+- Baseline app image size from the latest validated build in this branch: `0x108b10` bytes, with `0x6e4f0` bytes free in the `0x177000` app partition. `idf.py size` reported total image size `1084055` bytes, DIRAM `111133 / 341760` bytes used, and IRAM full at `16384 / 16384` bytes used.
 
 ## Repository Map
 
@@ -31,7 +31,7 @@ Before changing files, classify the task:
 - `main/homekit.cpp`: HomeKit accessory/service creation, setup code/id, notification queue, GDO-to-HomeKit state mapping, HomeKit write callbacks.
 - `main/homekit_decl.h`: HomeKit characteristic value constants and garage door enum aliases.
 - `main/homekit.h`: HomeKit task and notification function declarations.
-- `main/wifi.cpp` / `main/wifi.h`: Wi-Fi provisioning through `nvs_wifi_connect`.
+- `main/wifi.cpp` / `main/wifi.h`: Wi-Fi provisioning through `nvs_wifi_connect`, plus app HTTP handlers for `GET /api/status` and read-only `POST /api/gdo/refresh`.
 - `main/tasks.h`: HomeKit FreeRTOS task name, priority, and stack size.
 - `sdkconfig.defaults`: authoritative project defaults; `sdkconfig` is ignored and should stay local.
 - `scripts/update-espwebtools-manifest.rb`: release manifest generator used by CI.
@@ -114,12 +114,12 @@ Do not run `idf.py flash`, `idf.py erase-flash`, `idf.py monitor`, or HomeKit/NV
 - Treat garage door open/close and lock/unlock commands as safety-sensitive. Do not add automatic movement, retry loops, or state changes without explicit intent and clear bounds.
 - Treat GDO learn mode, paired-device clearing, protocol selection, client ID changes, rolling-code changes, command interval changes, and toggle-only mode as high-risk. `gdolib` exposes APIs for them, but this firmware currently uses only a narrow subset at runtime.
 - Keep GDO event handling lightweight. The existing pattern is: `gdolib` callback logs and calls `notify_homekit_*`; HomeKit characteristic updates happen through `gdo_notif_event_q` in `homekit_task_entry`.
-- Be careful with queue behavior. `gdo_notif_event_q` is depth 5 and notification sends are non-blocking; frequent new events may be dropped unless the queue strategy is changed deliberately.
+- Be careful with queue behavior. `gdo_notif_event_q` is depth 16 and notification sends are non-blocking; frequent new events may be dropped unless the queue strategy is changed deliberately.
 - Preserve Wi-Fi/HomeKit initialization ordering. `app_wifi_init()` is called after HomeKit setup because HomeKit installs event handlers and ordering matters.
 - Do not enable the commented `hap_reset_homekit_data()` block unless the user explicitly asks to reset pairing data.
 - Do not change `hap_set_setup_code("251-02-023")`, `hap_set_setup_id("KCTD")`, the provisioning AP SSID `konnected-blaq-hk`, or accessory identity fields unless the task is specifically about provisioning, pairing, or branding.
 - Do not change GPIO pins or UART settings casually. Current GDO config uses inverted UART on `UART_NUM_1`, TX `GPIO_NUM_1`, RX `GPIO_NUM_2`, obstruction input `GPIO_NUM_5`, and `obst_from_status = true`.
-- Be cautious with rolling-code sync behavior in `gdo_event_handler`. It currently advances the rolling code by 100 and retries sync when unsynced. Any change here can affect opener pairing and security behavior.
+- Be cautious with rolling-code sync behavior in `gdo_event_handler`. It currently allows at most three automatic rolling-code recovery jumps of 100 per boot before leaving the value unchanged. Any change here can affect opener pairing and security behavior.
 - `gdo_get_status()` is documented as running in a critical section. Do not call it from hot paths or long-running logic without a clear reason.
 - Keep `sdkconfig.defaults` as the committed configuration source. Do not commit generated `sdkconfig`, `sdkconfig.old`, `managed_components/`, `build/`, or `.cache/`. The root `dependencies.lock` is currently ignored; if release reproducibility becomes the task, decide explicitly whether to track it or tighten managed component pins.
 - Avoid editing submodule contents directly for ordinary app work. This IDF 6 migration branch intentionally patches submodule code; keep those edits isolated in submodule commits and make sure the commits exist on a fetchable remote before relying on the superproject branch for reproducible builds.
@@ -139,9 +139,16 @@ Do not run `idf.py flash`, `idf.py erase-flash`, `idf.py monitor`, or HomeKit/NV
 ## Wi-Fi Notes
 
 - `nvs_wifi_connect()` reads saved Wi-Fi mode and credentials from NVS. If the first connection fails or NVS has no data, the component starts SoftAP mode.
-- `nvs_wifi_connect_start_http_server(NVS_WIFI_CONNECT_MODE_RESTART_ESP32, nullptr)` starts the configuration web server and reboots after credentials are saved.
-- Project defaults override the component defaults: configuration page URI `/`, websocket URI `/ws`, and SoftAP SSID `konnected-blaq-hk`.
-- The provisioning docs point users to `http://192.168.4.1`. If the URI, AP SSID, restart mode, or AP authentication changes, update `README.md` too.
+- `nvs_wifi_connect_start_http_server(...)` starts the Wi-Fi configuration web server. AP/fallback mode uses `NVS_WIFI_CONNECT_MODE_RESTART_ESP32`; STA mode uses `NVS_WIFI_CONNECT_MODE_STAY_ACTIVE`.
+- Project defaults override the component defaults: configuration page URI `/`, websocket URI `/ws`, HTTP port `8080`, and SoftAP SSID `konnected-blaq-hk`.
+- The provisioning docs point users to `http://192.168.4.1:8080/` in AP mode and `http://<device-ip>:8080/` in STA mode. If the URI, AP SSID, port, restart mode, or AP authentication changes, update `README.md` too.
+- The dashboard polls `/api/status` and exposes device/GDO/Wi-Fi/heap/build data. `POST /api/gdo/refresh` must remain read-only unless the user explicitly asks for web-based control and the safety model is revisited.
+
+## Reliability Notes
+
+- `main/app_health.cpp` starts a health supervisor task after GDO startup. It logs the reset reason, subscribes to the ESP-IDF task watchdog, feeds it every second, requests Wi-Fi reconnects, periodically probes GDO status, and reboots only after sustained Wi-Fi or GDO failure.
+- The health supervisor must not actuate the door. Use read-only status requests for health checks and keep reboot thresholds conservative to avoid false recovery loops.
+- `sdkconfig.defaults` intentionally enables task-watchdog panic/reboot. If task priorities, blocking loops, or watchdog timing change, verify with a real-device smoke test.
 
 ## Firmware Style
 
@@ -183,7 +190,7 @@ esptool --chip esp32s3 merge-bin \
 For hardware smoke validation after a build, use the host-side script in `tests/hardware_smoke.py`. It flashes only when `--flash` is passed, treats `--erase-flash` as destructive because it clears NVS/HomeKit pairing data, and checks serial boot logs for app startup, Wi-Fi mode, and provisioning HTTP readiness:
 
 ```sh
-python tests/hardware_smoke.py --port /dev/cu.usbmodemXXXX --build --flash --expect-wifi any
+python tests/hardware_smoke.py --port /dev/cu.usbmodemXXXX --build --flash --expect-wifi any --post-ready-seconds 35
 ```
 
 For fresh provisioning mode, use:

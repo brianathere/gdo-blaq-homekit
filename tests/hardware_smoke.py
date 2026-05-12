@@ -9,12 +9,15 @@ boot smoke test.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from pathlib import Path
@@ -29,6 +32,7 @@ except ImportError:  # pragma: no cover - exercised on machines without pyserial
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_APP_READY_RE = re.compile(r"\btest_main:\s+GDO started!")
+DEFAULT_HEALTH_READY_RE = re.compile(r"\bapp_health:\s+Reset reason:")
 DEFAULT_AP_READY_RE = re.compile(r"\bnvs_wifi_connect:\s+wifi_init_softap finished\. SSID:konnected-blaq-hk\b")
 DEFAULT_AP_MODE_RE = re.compile(r"\bwifi:\s+Running in AP mode\b")
 DEFAULT_STA_READY_RE = re.compile(r"\b(?:wifi:\s+Connected in STA mode|nvs_wifi_connect:\s+got ip:)")
@@ -56,6 +60,7 @@ class SmokeFailure(RuntimeError):
 class SmokeState:
     def __init__(self) -> None:
         self.app_ready = False
+        self.health_ready = False
         self.ap_ready = False
         self.sta_ready = False
         self.http_ready = False
@@ -66,6 +71,8 @@ class SmokeState:
         self.last_lines.append(line)
         if DEFAULT_APP_READY_RE.search(line):
             self.app_ready = True
+        if DEFAULT_HEALTH_READY_RE.search(line):
+            self.health_ready = True
         if DEFAULT_AP_READY_RE.search(line) or DEFAULT_AP_MODE_RE.search(line):
             self.ap_ready = True
         if DEFAULT_STA_READY_RE.search(line):
@@ -83,6 +90,8 @@ class SmokeState:
         missing: list[str] = []
         if not self.app_ready:
             missing.append("app boot marker: test_main: GDO started!")
+        if not self.health_ready:
+            missing.append("health supervisor startup marker: app_health: Reset reason:")
 
         if expect_wifi == "ap":
             if not self.ap_ready:
@@ -92,11 +101,13 @@ class SmokeState:
         elif expect_wifi == "sta":
             if not self.sta_ready:
                 missing.append("STA connected marker or got ip log")
+            if not self.http_ready:
+                missing.append("Wi-Fi configuration HTTP handler registration")
         elif expect_wifi == "any":
-            if self.ap_ready and not self.http_ready:
-                missing.append("provisioning HTTP handler registration after AP startup")
             if not (self.ap_ready or self.sta_ready):
                 missing.append("AP provisioning or STA connected Wi-Fi startup marker")
+            elif not self.http_ready:
+                missing.append("Wi-Fi configuration HTTP handler registration")
 
         return missing
 
@@ -198,6 +209,7 @@ def monitor_boot(args: argparse.Namespace, port: str) -> SmokeState:
     assert serial is not None
     state = SmokeState()
     deadline = time.monotonic() + args.timeout
+    post_ready_deadline: float | None = None
     partial = b""
 
     print(f"Monitoring {port} at {args.monitor_baud} baud for up to {args.timeout}s...", flush=True)
@@ -205,7 +217,7 @@ def monitor_boot(args: argparse.Namespace, port: str) -> SmokeState:
         ser.reset_input_buffer()
         if args.reset or args.flash:
             pulse_reset(ser)
-        while time.monotonic() < deadline:
+        while time.monotonic() < (post_ready_deadline or deadline):
             data = ser.read(ser.in_waiting or 1)
             if not data:
                 continue
@@ -217,8 +229,17 @@ def monitor_boot(args: argparse.Namespace, port: str) -> SmokeState:
                 if args.print_log:
                     print(line)
                 state.feed(line)
-                if state.passed(args.expect_wifi):
-                    return state
+                if state.passed(args.expect_wifi) and post_ready_deadline is None:
+                    if args.post_ready_seconds <= 0:
+                        return state
+                    post_ready_deadline = time.monotonic() + args.post_ready_seconds
+                    print(
+                        f"Boot smoke markers reached; monitoring for {args.post_ready_seconds:.1f}s more...",
+                        flush=True,
+                    )
+
+    if post_ready_deadline is not None:
+        return state
 
     missing = "\n - ".join(state.missing(args.expect_wifi))
     tail = "\n".join(state.last_lines)
@@ -234,9 +255,111 @@ def probe_http(url: str, timeout: float) -> None:
 
     if status != 200:
         raise SmokeFailure(f"HTTP probe returned status {status}")
-    expected = (b"Set WiFi params to NVS", b"Wifi SSID", b"Write WiFi data")
+    expected = (b"GDO blaQ HomeKit", b"Device Status", b"Wi-Fi Settings")
     if not any(marker in body for marker in expected):
-        raise SmokeFailure("HTTP probe succeeded but response did not look like the provisioning page")
+        raise SmokeFailure("HTTP probe succeeded but response did not look like the device status page")
+
+
+def probe_status_api(base_url: str, timeout: float) -> None:
+    status_url = urllib.parse.urljoin(base_url, "/api/status")
+    print(f"Probing {status_url}...", flush=True)
+    request = urllib.request.Request(status_url, headers={"User-Agent": "gdo-blaq-homekit-smoke/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read(16384)
+        status = getattr(response, "status", response.getcode())
+
+    if status != 200:
+        raise SmokeFailure(f"status API probe returned status {status}")
+
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SmokeFailure(f"status API returned invalid JSON: {exc}") from exc
+
+    for key in ("app", "gdo", "wifi", "heap"):
+        if key not in data:
+            raise SmokeFailure(f"status API response missing {key!r}")
+
+
+def http_json(method: str, url: str, timeout: float, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict]:
+    data = None
+    request_headers = {"User-Agent": "gdo-blaq-homekit-smoke/1.0", "Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(16384)
+            status = getattr(response, "status", response.getcode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read(16384)
+        status = exc.code
+
+    try:
+        parsed = json.loads(body.decode("utf-8")) if body else {}
+    except json.JSONDecodeError as exc:
+        raise SmokeFailure(f"{method} {url} returned invalid JSON: {exc}") from exc
+    return status, parsed
+
+
+def probe_management_apis(base_url: str, timeout: float, admin_pin: str | None) -> None:
+    endpoints = {
+        "events": "/api/events?limit=5",
+        "settings": "/api/settings",
+        "homekit setup": "/api/homekit/setup",
+    }
+    for name, path in endpoints.items():
+        url = urllib.parse.urljoin(base_url, path)
+        print(f"Probing {url}...", flush=True)
+        status, data = http_json("GET", url, timeout)
+        if status != 200:
+            raise SmokeFailure(f"{name} API returned status {status}")
+        if name == "events" and "events" not in data:
+            raise SmokeFailure("events API missing events list")
+        if name == "settings" and "settings" not in data:
+            raise SmokeFailure("settings API missing settings object")
+        if name == "homekit setup" and "setup_available" not in data:
+            raise SmokeFailure("homekit setup API missing setup_available")
+
+    clear_url = urllib.parse.urljoin(base_url, "/api/events/clear")
+    print(f"Checking admin rejection on {clear_url}...", flush=True)
+    status, _ = http_json("POST", clear_url, timeout, payload={})
+    if status != 403:
+        raise SmokeFailure(f"admin-protected events clear returned {status} without PIN; expected 403")
+
+    position_url = urllib.parse.urljoin(base_url, "/api/gdo/position")
+    status, _ = http_json("POST", position_url, timeout, payload={"target_percent": 50})
+    if status != 403:
+        raise SmokeFailure(f"admin-protected position command returned {status} without PIN; expected 403")
+
+    if not admin_pin:
+        return
+
+    settings_url = urllib.parse.urljoin(base_url, "/api/settings")
+    status, settings = http_json("GET", settings_url, timeout)
+    if status != 200:
+        raise SmokeFailure("settings API unavailable before admin PIN check")
+
+    headers = {"X-Admin-PIN": admin_pin}
+    if not settings.get("admin", {}).get("pin_configured"):
+        setup_url = urllib.parse.urljoin(base_url, "/api/admin/setup")
+        print(f"Creating admin PIN through {setup_url}...", flush=True)
+        status, data = http_json("POST", setup_url, timeout, payload={"pin": admin_pin})
+        if status != 200 or not data.get("ok"):
+            raise SmokeFailure(f"admin PIN setup failed with status {status}: {data}")
+    else:
+        check_url = urllib.parse.urljoin(base_url, "/api/admin/check")
+        print(f"Checking admin PIN through {check_url}...", flush=True)
+        status, data = http_json("POST", check_url, timeout, payload={}, headers=headers)
+        if status != 200 or not data.get("ok"):
+            raise SmokeFailure(f"admin PIN check failed with status {status}: {data}")
+
+    status, data = http_json("POST", clear_url, timeout, payload={}, headers=headers)
+    if status != 200 or not data.get("ok"):
+        raise SmokeFailure(f"admin-protected events clear failed with status {status}: {data}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -252,6 +375,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor-baud", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=90.0, help="Seconds to wait for boot smoke markers.")
     parser.add_argument(
+        "--post-ready-seconds",
+        type=float,
+        default=0.0,
+        help="Keep monitoring after boot markers are reached and fail if fatal logs appear.",
+    )
+    parser.add_argument(
         "--expect-wifi",
         choices=("any", "ap", "sta"),
         default="any",
@@ -259,7 +388,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--probe-url",
-        help="Optional HTTP URL to probe after serial smoke passes, for example http://192.168.4.1/.",
+        help="Optional HTTP URL to probe after serial smoke passes, for example http://192.168.4.1:8080/.",
+    )
+    parser.add_argument(
+        "--admin-pin",
+        default=os.environ.get("GDO_ADMIN_PIN"),
+        help="Optional admin PIN for protected API probes. Defaults to GDO_ADMIN_PIN.",
     )
     parser.add_argument("--probe-timeout", type=float, default=5.0)
     parser.add_argument("--no-print-log", dest="print_log", action="store_false", help="Do not stream serial logs to stdout.")
@@ -284,6 +418,8 @@ def main() -> int:
         state = monitor_boot(args, port)
         if args.probe_url:
             probe_http(args.probe_url, args.probe_timeout)
+            probe_status_api(args.probe_url, args.probe_timeout)
+            probe_management_apis(args.probe_url, args.probe_timeout, args.admin_pin)
 
         wifi_mode = "ap" if state.ap_ready else "sta" if state.sta_ready else "unknown"
         print(f"PASS: boot smoke markers reached; wifi={wifi_mode}; http_server={state.http_ready}")
