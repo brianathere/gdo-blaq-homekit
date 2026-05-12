@@ -184,8 +184,8 @@ Additional findings:
 
 - `esp-homekit-sdk` upstream currently has no release tags and no IDF 6 PR open that covers this migration.
 - Its GitLab CI currently builds IDF 5.1 through 5.5, not IDF 6.
-- `esp-homekit-sdk/examples/lightbulb` fails at CMake under IDF 6 because `examples/common/app_wifi` still requires `wifi_provisioning`.
-- `examples/common/app_wifi/app_wifi.c` also still uses `ESP_IF_WIFI_STA` in the hardcoded credential path, so source changes remain after the provisioning dependency is fixed.
+- `examples/common/app_wifi` now builds on IDF 6 using the managed `espressif/network_provisioning` component instead of the removed built-in `wifi_provisioning` component.
+- The HomeKit example hardcoded credential path now uses `WIFI_IF_STA` instead of `ESP_IF_WIFI_STA`.
 
 ## CI And Configuration Findings
 
@@ -198,6 +198,7 @@ Additional findings:
   - `espressif/json_parser` `1.0.3`
   - `espressif/libsodium` `1.0.22`
   - `espressif/mdns` `1.11.1`
+- The HomeKit examples also resolve `espressif/network_provisioning` `1.2.4` through `examples/common/app_wifi/idf_component.yml`.
 - For release reproducibility, consider either checking in a root `dependencies.lock` or pinning managed component versions tightly in manifests. Today the root build is green, but future component registry updates could change CI behavior.
 - `sdkconfig.defaults` uses `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y`. Current app size is close enough to matter but still has room.
 - `idf.py size` reported:
@@ -208,22 +209,32 @@ Additional findings:
 
 ## Validation Performed
 
-Firmware validation:
+Current build validation:
 
 ```sh
 . /Users/brianmeek/scratch/esp-idf-v6.0.1/export.sh
-idf.py fullclean
 idf.py build
-idf.py size
-esptool --chip esp32s3 merge-bin \
-  -o build/konnected-gdo-blaq-homekit.bin \
-  --flash-mode dio --flash-size 4MB --flash-freq 80m \
-  0x0 build/bootloader/bootloader.bin \
-  0x8000 build/partition_table/partition-table.bin \
-  0x10000 build/gdo-blaq-homekit.bin
+idf.py -C components/gdolib/examples set-target esp32s3 build
+idf.py -C components/nvs_wifi_connect/example_nvs_wifi_connect set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/lightbulb set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/bridge set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/data_tlv8 set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/fan set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/smart_outlet set-target esp32s3 build
+idf.py -C esp-homekit-sdk/examples/emulator set-target esp32s3 build
+python3 -m py_compile tests/hardware_smoke.py
 ```
 
-Hardware smoke validation:
+Current results:
+
+- Product firmware build completed under ESP-IDF 6.0.1.
+- Product app binary size is `0x102200`; the smallest app partition has `0x74e00` bytes free, 31%.
+- `gdolib` example build completed after adding example component discovery and explicit dependency wiring.
+- `nvs_wifi_connect` example build completed after adding managed `espressif/mdns`, explicit `esp_event` / `esp_netif`, and WebSocket support defaults.
+- HomeKit examples `lightbulb`, `bridge`, `data_tlv8`, `fan`, `smart_outlet`, and `emulator` all built under ESP-IDF 6.0.1 after porting shared `app_wifi` to `espressif/network_provisioning`.
+- The `emulator` example needed header prototype fixes for the newer compiler's stricter handling of empty parameter lists.
+
+Hardware smoke validation from the earlier firmware bring-up:
 
 ```sh
 . /Users/brianmeek/scratch/esp-idf-v6.0.1/export.sh
@@ -244,13 +255,7 @@ Smoke result:
 - Device connected in STA mode using existing NVS credentials and got IP `192.168.68.59`.
 - Smoke script passed with `wifi=sta`.
 
-Submodule probes:
-
-- `gdolib` example under IDF 6: failed because example CMake does not expose the component to itself (`gdo.h` not found).
-- `nvs_wifi_connect` example under IDF 6: failed because `mdns` is not resolved as a managed dependency.
-- `esp-homekit-sdk` lightbulb example under IDF 6: failed because `app_wifi` still requires removed `wifi_provisioning`.
-
-Those probe failures do not affect the product firmware build, but they matter for upstream IDF 6 support claims.
+Submodule probes now pass for the examples listed above. These fixes should still be opened upstream where they are generic IDF 6 compatibility issues rather than product-specific patches.
 
 ## Patch Vs Upstream Summary
 
