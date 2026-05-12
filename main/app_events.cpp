@@ -1,7 +1,9 @@
 #include "app_events.h"
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -13,24 +15,37 @@
 
 static const char *TAG = "app_events";
 
-static constexpr size_t RAM_EVENT_COUNT = 128;
-static constexpr size_t CRITICAL_EVENT_COUNT = 32;
+static constexpr size_t RAM_EVENT_COUNT = 96;
+static constexpr size_t CRITICAL_EVENT_COUNT = 16;
 static constexpr uint32_t EVENTS_BLOB_MAGIC = 0x47444f45; // GDOE
-static constexpr uint32_t EVENTS_BLOB_VERSION = 1;
+static constexpr uint32_t EVENTS_BLOB_VERSION = 2;
+
+typedef struct {
+    uint32_t seq;
+    uint32_t time_ms;
+    int32_t value1;
+    int32_t value2;
+    int32_t value3;
+    uint16_t code_id;
+    uint8_t category_id;
+    uint8_t severity_id;
+} persisted_event_record_t;
 
 typedef struct {
     uint32_t magic;
     uint32_t version;
     uint32_t count;
     uint32_t next;
-    app_event_record_t records[CRITICAL_EVENT_COUNT];
+    persisted_event_record_t records[CRITICAL_EVENT_COUNT];
 } persisted_events_blob_t;
+
+static_assert(sizeof(persisted_events_blob_t) <= 512, "Persisted event blob must stay small for NVS and stack");
 
 static SemaphoreHandle_t s_lock;
 static app_event_record_t s_events[RAM_EVENT_COUNT];
 static size_t s_event_count;
 static size_t s_event_next;
-static app_event_record_t s_critical[CRITICAL_EVENT_COUNT];
+static persisted_event_record_t s_critical[CRITICAL_EVENT_COUNT];
 static size_t s_critical_count;
 static size_t s_critical_next;
 static uint32_t s_next_seq = 1;
@@ -63,6 +78,235 @@ static bool json_object_fragment(const char *value)
     return len >= 2 && value[0] == '{' && value[len - 1] == '}';
 }
 
+typedef struct {
+    uint16_t id;
+    const char *name;
+} id_name_t;
+
+typedef struct {
+    uint16_t id;
+    const char *code;
+    const char *message;
+} code_meta_t;
+
+enum : uint8_t {
+    EVENT_CAT_APP = 0,
+    EVENT_CAT_BOOT,
+    EVENT_CAT_GDO,
+    EVENT_CAT_HOMEKIT,
+    EVENT_CAT_WIFI,
+    EVENT_CAT_WATCHDOG,
+    EVENT_CAT_HTTP,
+    EVENT_CAT_SETTINGS,
+};
+
+enum : uint8_t {
+    EVENT_SEV_INFO = 0,
+    EVENT_SEV_WARN,
+    EVENT_SEV_ERROR,
+};
+
+enum : uint16_t {
+    EVENT_CODE_UNKNOWN = 0,
+    EVENT_CODE_RESET,
+    EVENT_CODE_GDO_SYNC_FAILED,
+    EVENT_CODE_OBSTRUCTION,
+    EVENT_CODE_ROLLING_CODE_RECOVERY,
+    EVENT_CODE_ADMIN_PIN_SET,
+    EVENT_CODE_EVENTS_CLEARED,
+    EVENT_CODE_SETTINGS_SAVED,
+    EVENT_CODE_CONTROLLER_PAIRED,
+    EVENT_CODE_CONTROLLER_UNPAIRED,
+    EVENT_CODE_PAIRING_ABORTED,
+    EVENT_CODE_ACCESSORY_REBOOTING,
+    EVENT_CODE_STA_DISCONNECTED,
+    EVENT_CODE_WIFI_RECONNECT,
+    EVENT_CODE_HEALTH_REBOOT,
+    EVENT_CODE_HEALTH_RESYNC_FAILED,
+    EVENT_CODE_HEALTH_STATUS_FAILED,
+    EVENT_CODE_GDO_REFRESH,
+    EVENT_CODE_MANUAL_SYNC,
+    EVENT_CODE_PARTIAL_OPEN,
+};
+
+static const id_name_t CATEGORY_NAMES[] = {
+    {EVENT_CAT_APP, "app"},
+    {EVENT_CAT_BOOT, "boot"},
+    {EVENT_CAT_GDO, "gdo"},
+    {EVENT_CAT_HOMEKIT, "homekit"},
+    {EVENT_CAT_WIFI, "wifi"},
+    {EVENT_CAT_WATCHDOG, "watchdog"},
+    {EVENT_CAT_HTTP, "http"},
+    {EVENT_CAT_SETTINGS, "settings"},
+};
+
+static const id_name_t SEVERITY_NAMES[] = {
+    {EVENT_SEV_INFO, "info"},
+    {EVENT_SEV_WARN, "warn"},
+    {EVENT_SEV_ERROR, "error"},
+};
+
+static const code_meta_t CODE_META[] = {
+    {EVENT_CODE_UNKNOWN, "unknown", "Persisted critical event"},
+    {EVENT_CODE_RESET, "reset", "Boot reset reason"},
+    {EVENT_CODE_GDO_SYNC_FAILED, "gdo_sync_failed", "GDO sync failed"},
+    {EVENT_CODE_OBSTRUCTION, "obstruction", "Obstruction state changed"},
+    {EVENT_CODE_ROLLING_CODE_RECOVERY, "rolling_code_recovery", "Rolling code advanced for sync recovery"},
+    {EVENT_CODE_ADMIN_PIN_SET, "admin_pin_set", "Admin PIN configured"},
+    {EVENT_CODE_EVENTS_CLEARED, "events_cleared", "Diagnostics events cleared"},
+    {EVENT_CODE_SETTINGS_SAVED, "settings_saved", "GDO settings saved"},
+    {EVENT_CODE_CONTROLLER_PAIRED, "controller_paired", "HomeKit controller paired"},
+    {EVENT_CODE_CONTROLLER_UNPAIRED, "controller_unpaired", "HomeKit controller unpaired"},
+    {EVENT_CODE_PAIRING_ABORTED, "pairing_aborted", "HomeKit pairing aborted"},
+    {EVENT_CODE_ACCESSORY_REBOOTING, "accessory_rebooting", "HomeKit accessory requested reboot"},
+    {EVENT_CODE_STA_DISCONNECTED, "sta_disconnected", "STA Wi-Fi disconnected"},
+    {EVENT_CODE_WIFI_RECONNECT, "wifi_reconnect", "STA has no IP; reconnect requested"},
+    {EVENT_CODE_HEALTH_REBOOT, "health_reboot", "Health supervisor requested reboot"},
+    {EVENT_CODE_HEALTH_RESYNC_FAILED, "health_resync_failed", "GDO health resync request failed"},
+    {EVENT_CODE_HEALTH_STATUS_FAILED, "health_status_failed", "GDO health status request failed"},
+    {EVENT_CODE_GDO_REFRESH, "gdo_refresh", "GDO status refresh failed"},
+    {EVENT_CODE_MANUAL_SYNC, "manual_sync", "Manual GDO sync requested"},
+    {EVENT_CODE_PARTIAL_OPEN, "partial_open", "Partial-open command failed"},
+};
+
+static const id_name_t REASON_NAMES[] = {
+    {0, "unknown"},
+    {1, "power-on"},
+    {2, "external"},
+    {3, "software"},
+    {4, "panic"},
+    {5, "interrupt-watchdog"},
+    {6, "task-watchdog"},
+    {7, "watchdog"},
+    {8, "deep-sleep"},
+    {9, "brownout"},
+    {10, "sdio"},
+    {20, "HomeKit did not start"},
+    {21, "STA WiFi has been disconnected too long"},
+    {22, "GDO has been unsynced too long"},
+    {23, "GDO has not produced valid RX traffic too long"},
+};
+
+static const id_name_t RESULT_NAMES[] = {
+    {0, "unknown"},
+    {1, "ESP_OK"},
+    {2, "ESP_FAIL"},
+    {3, "ESP_ERR_NO_MEM"},
+    {4, "ESP_ERR_INVALID_ARG"},
+    {5, "ESP_ERR_INVALID_STATE"},
+    {6, "ESP_ERR_TIMEOUT"},
+    {7, "ESP_ERR_NOT_FINISHED"},
+    {8, "ESP_ERR_NOT_FOUND"},
+    {9, "ESP_ERR_NVS_NOT_ENOUGH_SPACE"},
+    {10, "ESP_ERR_WIFI_NOT_INIT"},
+};
+
+static const id_name_t PROTOCOL_NAMES[] = {
+    {0, "Unknown"},
+    {1, "Security+ 1.0"},
+    {2, "Security+ 2.0"},
+    {3, "Security+ 1.0 with smart panel"},
+};
+
+static const id_name_t OBSTRUCTION_NAMES[] = {
+    {0, "Unknown"},
+    {1, "Obstructed"},
+    {2, "Clear"},
+};
+
+static uint16_t id_for_name(const id_name_t *values, size_t count, const char *name, uint16_t fallback)
+{
+    if (!name) {
+        return fallback;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (strcmp(values[i].name, name) == 0) {
+            return values[i].id;
+        }
+    }
+    return fallback;
+}
+
+static const char *name_for_id(const id_name_t *values, size_t count, uint16_t id, const char *fallback)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i].id == id) {
+            return values[i].name;
+        }
+    }
+    return fallback;
+}
+
+static uint16_t code_id_for_name(const char *code)
+{
+    if (!code) {
+        return EVENT_CODE_UNKNOWN;
+    }
+    for (size_t i = 0; i < sizeof(CODE_META) / sizeof(CODE_META[0]); ++i) {
+        if (strcmp(CODE_META[i].code, code) == 0) {
+            return CODE_META[i].id;
+        }
+    }
+    return EVENT_CODE_UNKNOWN;
+}
+
+static const code_meta_t *code_meta_for_id(uint16_t id)
+{
+    for (size_t i = 0; i < sizeof(CODE_META) / sizeof(CODE_META[0]); ++i) {
+        if (CODE_META[i].id == id) {
+            return &CODE_META[i];
+        }
+    }
+    return &CODE_META[0];
+}
+
+static int32_t json_int_value(const char *json, const char *key, int32_t fallback)
+{
+    if (!json || !key) {
+        return fallback;
+    }
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (!p) {
+        return fallback;
+    }
+    p += strlen(pattern);
+    return (int32_t)strtol(p, NULL, 10);
+}
+
+static bool json_string_value(const char *json, const char *key, char *out, size_t out_size)
+{
+    if (!json || !key || !out || out_size == 0) {
+        return false;
+    }
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) {
+        out[0] = 0;
+        return false;
+    }
+    p += strlen(pattern);
+    size_t len = strcspn(p, "\"");
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, p, len);
+    out[len] = 0;
+    return true;
+}
+
+static uint16_t json_string_id(const char *json, const char *key, const id_name_t *values,
+                               size_t count, uint16_t fallback)
+{
+    char value[64];
+    if (!json_string_value(json, key, value, sizeof(value))) {
+        return fallback;
+    }
+    return id_for_name(values, count, value, fallback);
+}
+
 static void append_record_locked(const app_event_record_t *record)
 {
     if (s_event_count == RAM_EVENT_COUNT) {
@@ -75,6 +319,179 @@ static void append_record_locked(const app_event_record_t *record)
 
     if (record->seq >= s_next_seq) {
         s_next_seq = record->seq + 1;
+    }
+}
+
+static void erase_critical_events_blob(void)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open("gdo_diag", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return;
+    }
+    err = nvs_erase_key(nvs, "crit_events");
+    if (err == ESP_OK) {
+        (void)nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+}
+
+static esp_err_t write_critical_events_blob(const persisted_events_blob_t *blob)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open("gdo_diag", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_blob(nvs, "crit_events", blob, sizeof(*blob));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        esp_err_t erase_err = nvs_erase_key(nvs, "crit_events");
+        if (erase_err == ESP_ERR_NVS_NOT_FOUND) {
+            erase_err = ESP_OK;
+        }
+        if (erase_err == ESP_OK) {
+            erase_err = nvs_commit(nvs);
+        }
+        if (erase_err == ESP_OK) {
+            err = nvs_set_blob(nvs, "crit_events", blob, sizeof(*blob));
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static persisted_event_record_t encode_persisted_record(const app_event_record_t *record)
+{
+    persisted_event_record_t out = {};
+    if (!record) {
+        return out;
+    }
+
+    out.seq = record->seq;
+    out.time_ms = record->time_ms;
+    out.category_id = (uint8_t)id_for_name(CATEGORY_NAMES, sizeof(CATEGORY_NAMES) / sizeof(CATEGORY_NAMES[0]),
+                                           record->category, EVENT_CAT_APP);
+    out.severity_id = (uint8_t)id_for_name(SEVERITY_NAMES, sizeof(SEVERITY_NAMES) / sizeof(SEVERITY_NAMES[0]),
+                                           record->severity, EVENT_SEV_WARN);
+    out.code_id = code_id_for_name(record->code);
+
+    switch (out.code_id) {
+    case EVENT_CODE_RESET:
+    case EVENT_CODE_HEALTH_REBOOT:
+        out.value1 = json_string_id(record->data_json, "reason", REASON_NAMES,
+                                    sizeof(REASON_NAMES) / sizeof(REASON_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_STA_DISCONNECTED:
+        out.value1 = json_int_value(record->data_json, "reason", 0);
+        break;
+    case EVENT_CODE_GDO_SYNC_FAILED:
+        out.value1 = json_string_id(record->data_json, "protocol", PROTOCOL_NAMES,
+                                    sizeof(PROTOCOL_NAMES) / sizeof(PROTOCOL_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_OBSTRUCTION:
+        out.value1 = json_string_id(record->data_json, "obstruction", OBSTRUCTION_NAMES,
+                                    sizeof(OBSTRUCTION_NAMES) / sizeof(OBSTRUCTION_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_ROLLING_CODE_RECOVERY:
+        out.value1 = json_int_value(record->data_json, "old", 0);
+        out.value2 = json_int_value(record->data_json, "new", 0);
+        out.value3 = json_int_value(record->data_json, "attempt", 0);
+        break;
+    case EVENT_CODE_GDO_REFRESH:
+    case EVENT_CODE_MANUAL_SYNC:
+    case EVENT_CODE_HEALTH_RESYNC_FAILED:
+    case EVENT_CODE_HEALTH_STATUS_FAILED:
+        out.value1 = json_string_id(record->data_json, "result", RESULT_NAMES,
+                                    sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_PARTIAL_OPEN:
+        out.value1 = json_int_value(record->data_json, "target_percent", -1);
+        out.value2 = json_string_id(record->data_json, "result", RESULT_NAMES,
+                                    sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]), 0);
+        break;
+    default:
+        break;
+    }
+    return out;
+}
+
+static void decode_persisted_record(const persisted_event_record_t *record, app_event_record_t *out)
+{
+    if (!record || !out) {
+        return;
+    }
+
+    memset(out, 0, sizeof(*out));
+    const code_meta_t *meta = code_meta_for_id(record->code_id);
+    out->seq = record->seq;
+    out->time_ms = record->time_ms;
+    out->persisted = true;
+    copy_text(out->category, sizeof(out->category),
+              name_for_id(CATEGORY_NAMES, sizeof(CATEGORY_NAMES) / sizeof(CATEGORY_NAMES[0]),
+                          record->category_id, "app"));
+    copy_text(out->severity, sizeof(out->severity),
+              name_for_id(SEVERITY_NAMES, sizeof(SEVERITY_NAMES) / sizeof(SEVERITY_NAMES[0]),
+                          record->severity_id, "warn"));
+    copy_text(out->code, sizeof(out->code), meta->code);
+    copy_text(out->message, sizeof(out->message), meta->message);
+
+    switch (record->code_id) {
+    case EVENT_CODE_RESET: {
+        const char *reason = name_for_id(REASON_NAMES, sizeof(REASON_NAMES) / sizeof(REASON_NAMES[0]),
+                                         (uint16_t)record->value1, "unknown");
+        snprintf(out->message, sizeof(out->message), "Boot reset reason: %s", reason);
+        snprintf(out->data_json, sizeof(out->data_json), "{\"reason\":\"%s\"}", reason);
+        break;
+    }
+    case EVENT_CODE_HEALTH_REBOOT: {
+        const char *reason = name_for_id(REASON_NAMES, sizeof(REASON_NAMES) / sizeof(REASON_NAMES[0]),
+                                         (uint16_t)record->value1, "unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"reason\":\"%s\"}", reason);
+        break;
+    }
+    case EVENT_CODE_STA_DISCONNECTED:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"reason\":%" PRId32 "}", record->value1);
+        break;
+    case EVENT_CODE_GDO_SYNC_FAILED: {
+        const char *protocol = name_for_id(PROTOCOL_NAMES, sizeof(PROTOCOL_NAMES) / sizeof(PROTOCOL_NAMES[0]),
+                                           (uint16_t)record->value1, "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"synced\":false,\"protocol\":\"%s\"}", protocol);
+        break;
+    }
+    case EVENT_CODE_OBSTRUCTION: {
+        const char *obstruction = name_for_id(OBSTRUCTION_NAMES, sizeof(OBSTRUCTION_NAMES) / sizeof(OBSTRUCTION_NAMES[0]),
+                                              (uint16_t)record->value1, "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"obstruction\":\"%s\"}", obstruction);
+        break;
+    }
+    case EVENT_CODE_ROLLING_CODE_RECOVERY:
+        snprintf(out->data_json, sizeof(out->data_json),
+                 "{\"old\":%" PRId32 ",\"new\":%" PRId32 ",\"attempt\":%" PRId32 "}",
+                 record->value1, record->value2, record->value3);
+        break;
+    case EVENT_CODE_GDO_REFRESH:
+    case EVENT_CODE_MANUAL_SYNC:
+    case EVENT_CODE_HEALTH_RESYNC_FAILED:
+    case EVENT_CODE_HEALTH_STATUS_FAILED: {
+        const char *result = name_for_id(RESULT_NAMES, sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]),
+                                         (uint16_t)record->value1, "unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"result\":\"%s\"}", result);
+        break;
+    }
+    case EVENT_CODE_PARTIAL_OPEN: {
+        const char *result = name_for_id(RESULT_NAMES, sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]),
+                                         (uint16_t)record->value2, "unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"target_percent\":%" PRId32 ",\"result\":\"%s\"}",
+                 record->value1, result);
+        break;
+    }
+    default:
+        copy_text(out->data_json, sizeof(out->data_json), "{}");
+        break;
     }
 }
 
@@ -92,29 +509,18 @@ static void save_critical_events(void)
         xSemaphoreGive(s_lock);
     }
 
-    nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open("gdo_diag", NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Unable to open diagnostics NVS: %s", esp_err_to_name(err));
-        return;
-    }
-    err = nvs_set_blob(nvs, "crit_events", &blob, sizeof(blob));
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs);
-    }
+    esp_err_t err = write_critical_events_blob(&blob);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Unable to persist diagnostics events: %s", esp_err_to_name(err));
     }
-    nvs_close(nvs);
 }
 
-static void add_critical_locked(app_event_record_t *record)
+static void add_critical_locked(const app_event_record_t *record)
 {
-    record->persisted = true;
     if (s_critical_count < CRITICAL_EVENT_COUNT) {
         ++s_critical_count;
     }
-    s_critical[s_critical_next] = *record;
+    s_critical[s_critical_next] = encode_persisted_record(record);
     s_critical_next = (s_critical_next + 1) % CRITICAL_EVENT_COUNT;
 }
 
@@ -189,6 +595,7 @@ esp_err_t app_events_init(void)
     persisted_events_blob_t blob = {};
     size_t blob_size = sizeof(blob);
     nvs_handle_t nvs = 0;
+    bool erase_stale_blob = false;
     esp_err_t err = nvs_open("gdo_diag", NVS_READONLY, &nvs);
     if (err == ESP_OK) {
         err = nvs_get_blob(nvs, "crit_events", &blob, &blob_size);
@@ -201,14 +608,20 @@ esp_err_t app_events_init(void)
             memcpy(s_critical, blob.records, sizeof(s_critical));
             for (size_t i = 0; i < s_critical_count; ++i) {
                 size_t idx = (s_critical_next + CRITICAL_EVENT_COUNT - s_critical_count + i) % CRITICAL_EVENT_COUNT;
-                s_critical[idx].persisted = true;
-                append_record_locked(&s_critical[idx]);
+                app_event_record_t decoded = {};
+                decode_persisted_record(&s_critical[idx], &decoded);
+                append_record_locked(&decoded);
             }
+        } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+            erase_stale_blob = true;
         }
     }
 
     s_initialized = true;
     xSemaphoreGive(s_lock);
+    if (erase_stale_blob) {
+        erase_critical_events_blob();
+    }
     return ESP_OK;
 }
 
@@ -233,6 +646,7 @@ void app_events_log(const char *category, const char *severity, const char *code
     xSemaphoreTake(s_lock, portMAX_DELAY);
     record.seq = s_next_seq++;
     if (should_persist) {
+        record.persisted = true;
         add_critical_locked(&record);
     }
     append_record_locked(&record);
@@ -303,7 +717,7 @@ void app_events_get_summary(app_events_summary_t *summary)
     if (s_critical_count > 0) {
         size_t idx = (s_critical_next + CRITICAL_EVENT_COUNT - 1) % CRITICAL_EVENT_COUNT;
         summary->has_last_critical = true;
-        summary->last_critical = s_critical[idx];
+        decode_persisted_record(&s_critical[idx], &summary->last_critical);
     }
     xSemaphoreGive(s_lock);
 }

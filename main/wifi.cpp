@@ -30,6 +30,7 @@ extern "C" {
 }
 
 static const char* TAG = "wifi";
+static constexpr size_t ADMIN_PIN_BUFFER_SIZE = 72;
 
 static uint32_t millis(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -372,6 +373,7 @@ static std::string build_status_json(void) {
 
 static esp_err_t send_json_response(httpd_req_t *req, const std::string &json) {
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_sendstr(req, json.c_str());
 }
 
@@ -448,21 +450,98 @@ static bool get_admin_pin_from_header(httpd_req_t *req, char *pin, size_t pin_si
     return httpd_req_get_hdr_value_str(req, "X-Admin-PIN", pin, pin_size) == ESP_OK;
 }
 
-static esp_err_t require_admin(httpd_req_t *req, const std::string *body = nullptr) {
-    if (!app_admin_pin_configured()) {
-        return send_error_response(req, "403 Forbidden", "admin_pin_required");
+static bool get_admin_pin_from_query(httpd_req_t *req, char *pin, size_t pin_size) {
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0 || query_len >= 128 || pin_size == 0) {
+        return false;
     }
 
-    char pin[40] = {};
-    if (get_admin_pin_from_header(req, pin, sizeof(pin)) && app_admin_check_pin(pin)) {
-        return ESP_OK;
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
     }
-    if (body && json_get_string_value(*body, "pin", pin, sizeof(pin)) && app_admin_check_pin(pin)) {
-        return ESP_OK;
+    if (httpd_query_key_value(query, "pin", pin, pin_size) == ESP_OK) {
+        return true;
+    }
+    return httpd_query_key_value(query, "password", pin, pin_size) == ESP_OK;
+}
+
+static bool get_admin_pin_from_cookie(httpd_req_t *req, char *pin, size_t pin_size) {
+    size_t len = httpd_req_get_hdr_value_len(req, "Cookie");
+    if (len == 0 || len >= 256 || pin_size == 0) {
+        return false;
+    }
+
+    char cookie[256];
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
+        return false;
+    }
+
+    static const char *key = "gdo_admin_pin=";
+    const size_t key_len = strlen(key);
+    for (char *match = strstr(cookie, key); match; match = strstr(match + key_len, key)) {
+        if (match != cookie && match[-1] != ';' && match[-1] != ' ') {
+            continue;
+        }
+        const char *value = match + key_len;
+        size_t value_len = strcspn(value, ";");
+        if (value_len == 0 || value_len >= pin_size) {
+            return false;
+        }
+        memcpy(pin, value, value_len);
+        pin[value_len] = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool get_admin_pin_from_request(httpd_req_t *req, char *pin, size_t pin_size) {
+    return get_admin_pin_from_header(req, pin, pin_size) ||
+           get_admin_pin_from_query(req, pin, pin_size) ||
+           get_admin_pin_from_cookie(req, pin, pin_size);
+}
+
+static bool get_admin_pin_from_body(const std::string &body, char *pin, size_t pin_size) {
+    return json_get_string_value(body, "pin", pin, pin_size) ||
+           json_get_string_value(body, "current_pin", pin, pin_size) ||
+           json_get_string_value(body, "password", pin, pin_size);
+}
+
+static bool web_access_allowed(httpd_req_t *req) {
+    if (!app_admin_pin_configured()) {
+        return true;
+    }
+
+    char pin[ADMIN_PIN_BUFFER_SIZE] = {};
+    if (get_admin_pin_from_request(req, pin, sizeof(pin)) && app_admin_check_pin(pin)) {
+        return true;
+    }
+
+    (void)send_error_response(req, "401 Unauthorized", "web_auth_required");
+    return false;
+}
+
+static esp_err_t require_web_access(httpd_req_t *req) {
+    return web_access_allowed(req) ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static bool require_admin(httpd_req_t *req, const std::string *body = nullptr) {
+    if (!app_admin_pin_configured()) {
+        (void)send_error_response(req, "403 Forbidden", "admin_password_required");
+        return false;
+    }
+
+    char pin[ADMIN_PIN_BUFFER_SIZE] = {};
+    if (get_admin_pin_from_request(req, pin, sizeof(pin)) && app_admin_check_pin(pin)) {
+        return true;
+    }
+    if (body && get_admin_pin_from_body(*body, pin, sizeof(pin)) && app_admin_check_pin(pin)) {
+        return true;
     }
 
     app_events_log("http", "warn", "admin_auth_failed", "Admin authentication failed", "{}", false);
-    return send_error_response(req, "403 Forbidden", "bad_admin_pin");
+    (void)send_error_response(req, "403 Forbidden", "bad_admin_password");
+    return false;
 }
 
 static bool query_value(httpd_req_t *req, const char *key, char *value, size_t value_size) {
@@ -492,11 +571,37 @@ static size_t query_limit(httpd_req_t *req, size_t default_limit, size_t max_lim
     return (size_t)parsed;
 }
 
+static esp_err_t access_get_handler(httpd_req_t *req) {
+    const bool configured = app_admin_pin_configured();
+    bool authenticated = !configured;
+    if (configured) {
+        char pin[ADMIN_PIN_BUFFER_SIZE] = {};
+        authenticated = get_admin_pin_from_request(req, pin, sizeof(pin)) && app_admin_check_pin(pin);
+    }
+
+    std::string json;
+    json.reserve(96);
+    json += "{\"password_configured\":";
+    json += configured ? "true" : "false";
+    json += ",\"admin_pin_configured\":";
+    json += configured ? "true" : "false";
+    json += ",\"authenticated\":";
+    json += authenticated ? "true" : "false";
+    json += '}';
+    return send_json_response(req, json);
+}
+
 static esp_err_t status_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     return send_json_response(req, build_status_json());
 }
 
 static esp_err_t gdo_refresh_post_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     esp_err_t request_err = gdo_request_status();
     app_events_log("http", request_err == ESP_OK ? "info" : "warn", "gdo_refresh",
                    request_err == ESP_OK ? "GDO status refresh requested" : "GDO status refresh failed",
@@ -512,6 +617,9 @@ static esp_err_t gdo_refresh_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t events_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     char category[16] = {};
     char severity[8] = {};
     query_value(req, "category", category, sizeof(category));
@@ -521,9 +629,8 @@ static esp_err_t events_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t events_clear_post_handler(httpd_req_t *req) {
-    esp_err_t auth = require_admin(req);
-    if (auth != ESP_OK) {
-        return auth;
+    if (!require_admin(req)) {
+        return ESP_OK;
     }
     esp_err_t err = app_events_clear();
     if (err != ESP_OK) {
@@ -534,25 +641,36 @@ static esp_err_t events_clear_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t admin_setup_post_handler(httpd_req_t *req) {
-    if (app_admin_pin_configured()) {
-        return send_error_response(req, "409 Conflict", "admin_pin_already_configured");
-    }
-
     std::string body;
     esp_err_t err = read_request_body(req, body, 256);
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "bad_request", esp_err_to_name(err));
     }
 
-    char pin[40] = {};
-    if (!json_get_string_value(body, "pin", pin, sizeof(pin))) {
-        return send_error_response(req, "400 Bad Request", "missing_pin");
+    const bool configured = app_admin_pin_configured();
+    if (configured) {
+        if (!require_admin(req, &body)) {
+            return ESP_OK;
+        }
     }
+
+    char pin[ADMIN_PIN_BUFFER_SIZE] = {};
+    if (configured) {
+        if (!json_get_string_value(body, "new_pin", pin, sizeof(pin)) &&
+            !json_get_string_value(body, "new_password", pin, sizeof(pin)) &&
+            !json_get_string_value(body, "pin", pin, sizeof(pin))) {
+            return send_error_response(req, "400 Bad Request", "missing_new_password");
+        }
+    } else if (!json_get_string_value(body, "pin", pin, sizeof(pin)) &&
+               !json_get_string_value(body, "password", pin, sizeof(pin))) {
+        return send_error_response(req, "400 Bad Request", "missing_password");
+    }
+
     err = app_admin_set_pin(pin);
     if (err != ESP_OK) {
-        return send_error_response(req, "400 Bad Request", "invalid_pin", esp_err_to_name(err));
+        return send_error_response(req, "400 Bad Request", "invalid_password", esp_err_to_name(err));
     }
-    return send_json_response(req, "{\"ok\":true}");
+    return send_json_response(req, "{\"ok\":true,\"password_configured\":true}");
 }
 
 static esp_err_t admin_check_post_handler(httpd_req_t *req) {
@@ -561,14 +679,16 @@ static esp_err_t admin_check_post_handler(httpd_req_t *req) {
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "bad_request", esp_err_to_name(err));
     }
-    err = require_admin(req, &body);
-    if (err != ESP_OK) {
-        return err;
+    if (!require_admin(req, &body)) {
+        return ESP_OK;
     }
-    return send_json_response(req, "{\"ok\":true}");
+    return send_json_response(req, "{\"ok\":true,\"authenticated\":true}");
 }
 
 static esp_err_t settings_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     return send_json_response(req, app_settings_build_json());
 }
 
@@ -578,9 +698,8 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "bad_request", esp_err_to_name(err));
     }
-    err = require_admin(req, &body);
-    if (err != ESP_OK) {
-        return err;
+    if (!require_admin(req, &body)) {
+        return ESP_OK;
     }
 
     app_settings_t old_settings = {};
@@ -649,9 +768,8 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t gdo_sync_post_handler(httpd_req_t *req) {
-    esp_err_t auth = require_admin(req);
-    if (auth != ESP_OK) {
-        return auth;
+    if (!require_admin(req)) {
+        return ESP_OK;
     }
     esp_err_t err = gdo_sync();
     char data[48];
@@ -673,9 +791,8 @@ static esp_err_t gdo_position_post_handler(httpd_req_t *req) {
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "bad_request", esp_err_to_name(err));
     }
-    err = require_admin(req, &body);
-    if (err != ESP_OK) {
-        return err;
+    if (!require_admin(req, &body)) {
+        return ESP_OK;
     }
 
     int target_percent = -1;
@@ -720,6 +837,9 @@ static esp_err_t gdo_position_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t homekit_setup_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     int paired_count = homekit_paired_controller_count();
     char *payload = homekit_setup_payload();
     std::string json;
@@ -779,6 +899,9 @@ static std::string build_setup_qr_svg(const char *payload) {
 }
 
 static esp_err_t homekit_setup_qr_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
     char *payload = homekit_setup_payload();
     if (!payload) {
         return send_error_response(req, "404 Not Found", "setup_unavailable");
@@ -807,6 +930,7 @@ static esp_err_t app_register_http_handlers(httpd_handle_t server) {
         return ESP_OK;
     };
 
+    ESP_RETURN_ON_ERROR(register_uri("/api/access", HTTP_GET, access_get_handler), TAG, "access API");
     ESP_RETURN_ON_ERROR(register_uri("/api/status", HTTP_GET, status_get_handler), TAG, "status API");
     ESP_RETURN_ON_ERROR(register_uri("/api/events", HTTP_GET, events_get_handler), TAG, "events API");
     ESP_RETURN_ON_ERROR(register_uri("/api/events/clear", HTTP_POST, events_clear_post_handler), TAG, "events clear API");
@@ -823,6 +947,7 @@ static esp_err_t app_register_http_handlers(httpd_handle_t server) {
 }
 
 static void app_wifi_start_config_server(int restart_mode) {
+    nvs_wifi_connect_set_auth_handler(require_web_access);
     httpd_handle_t server = nvs_wifi_connect_start_http_server(restart_mode, app_register_http_handlers);
     if (server == nullptr) {
         ESP_LOGE(TAG, "Failed to start WiFi configuration HTTP server");

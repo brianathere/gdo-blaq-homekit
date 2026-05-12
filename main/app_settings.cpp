@@ -18,6 +18,7 @@ static const char *TAG = "app_settings";
 static constexpr uint32_t DEFAULT_MIN_COMMAND_INTERVAL_MS = 50;
 static constexpr size_t ADMIN_SALT_SIZE = 16;
 static constexpr size_t ADMIN_HASH_SIZE = 32;
+static constexpr size_t ADMIN_PASSWORD_MAX_SIZE = 64;
 
 static SemaphoreHandle_t s_lock;
 static app_settings_t s_settings = {
@@ -38,7 +39,7 @@ static bool valid_pin_text(const char *pin)
         return false;
     }
     size_t len = strlen(pin);
-    if (len < 4 || len > 32) {
+    if (len < 4 || len > ADMIN_PASSWORD_MAX_SIZE) {
         return false;
     }
     for (size_t i = 0; i < len; ++i) {
@@ -56,10 +57,10 @@ static bool valid_timing(uint16_t ms)
 
 static void hash_pin(const char *pin, const uint8_t salt[ADMIN_SALT_SIZE], uint8_t out[ADMIN_HASH_SIZE])
 {
-    uint8_t input[ADMIN_SALT_SIZE + 32] = {};
+    uint8_t input[ADMIN_SALT_SIZE + ADMIN_PASSWORD_MAX_SIZE] = {};
     size_t pin_len = strlen(pin);
-    if (pin_len > 32) {
-        pin_len = 32;
+    if (pin_len > ADMIN_PASSWORD_MAX_SIZE) {
+        pin_len = ADMIN_PASSWORD_MAX_SIZE;
     }
     memcpy(input, salt, ADMIN_SALT_SIZE);
     memcpy(input + ADMIN_SALT_SIZE, pin, pin_len);
