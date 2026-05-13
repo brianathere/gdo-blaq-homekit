@@ -16,6 +16,7 @@
 static const char *TAG = "app_settings";
 
 static constexpr uint32_t DEFAULT_MIN_COMMAND_INTERVAL_MS = 50;
+static constexpr uint32_t MAX_MIN_COMMAND_INTERVAL_MS = 60000;
 static constexpr size_t ADMIN_SALT_SIZE = 16;
 static constexpr size_t ADMIN_HASH_SIZE = 32;
 static constexpr size_t ADMIN_PASSWORD_MAX_SIZE = 64;
@@ -43,7 +44,8 @@ static bool valid_pin_text(const char *pin)
         return false;
     }
     for (size_t i = 0; i < len; ++i) {
-        if ((unsigned char)pin[i] < 0x21 || (unsigned char)pin[i] > 0x7e) {
+        if ((unsigned char)pin[i] < 0x21 || (unsigned char)pin[i] > 0x7e ||
+            pin[i] == '"' || pin[i] == '\\' || pin[i] == ';' || pin[i] == ',') {
             return false;
         }
     }
@@ -76,29 +78,32 @@ static bool constant_time_equal(const uint8_t *a, const uint8_t *b, size_t len)
     return diff == 0;
 }
 
-static esp_err_t save_settings_locked(void)
+static esp_err_t save_settings_locked(const app_settings_t *settings)
 {
+    if (!settings) {
+        return ESP_ERR_INVALID_ARG;
+    }
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open("gdo_app", NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         return err;
     }
 
-    err = nvs_set_u32(nvs, "protocol", s_settings.protocol_override);
+    err = nvs_set_u32(nvs, "protocol", settings->protocol_override);
     if (err == ESP_OK) {
-        err = nvs_set_u32(nvs, "obst_src", s_settings.obstruction_source);
+        err = nvs_set_u32(nvs, "obst_src", settings->obstruction_source);
     }
     if (err == ESP_OK) {
-        err = nvs_set_u32(nvs, "open_ms", s_settings.open_ms);
+        err = nvs_set_u32(nvs, "open_ms", settings->open_ms);
     }
     if (err == ESP_OK) {
-        err = nvs_set_u32(nvs, "close_ms", s_settings.close_ms);
+        err = nvs_set_u32(nvs, "close_ms", settings->close_ms);
     }
     if (err == ESP_OK) {
-        err = nvs_set_u32(nvs, "min_cmd_ms", s_settings.min_command_interval_ms);
+        err = nvs_set_u32(nvs, "min_cmd_ms", settings->min_command_interval_ms);
     }
     if (err == ESP_OK) {
-        err = nvs_set_u8(nvs, "toggle_only", s_settings.toggle_only ? 1 : 0);
+        err = nvs_set_u8(nvs, "toggle_only", settings->toggle_only ? 1 : 0);
     }
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
@@ -128,7 +133,8 @@ static esp_err_t load_settings(void)
     if (nvs_get_u32(nvs, "close_ms", &value) == ESP_OK && value <= UINT16_MAX && valid_timing((uint16_t)value)) {
         s_settings.close_ms = (uint16_t)value;
     }
-    if (nvs_get_u32(nvs, "min_cmd_ms", &value) == ESP_OK && value >= 50) {
+    if (nvs_get_u32(nvs, "min_cmd_ms", &value) == ESP_OK && value >= DEFAULT_MIN_COMMAND_INTERVAL_MS &&
+        value <= MAX_MIN_COMMAND_INTERVAL_MS) {
         s_settings.min_command_interval_ms = value;
     }
     uint8_t toggle = 0;
@@ -202,7 +208,8 @@ esp_err_t app_settings_apply_gdo_runtime(const app_settings_t *settings)
         return ESP_ERR_INVALID_ARG;
     }
     if (!valid_timing(settings->open_ms) || !valid_timing(settings->close_ms) ||
-        settings->min_command_interval_ms < 50) {
+        settings->min_command_interval_ms < DEFAULT_MIN_COMMAND_INTERVAL_MS ||
+        settings->min_command_interval_ms > MAX_MIN_COMMAND_INTERVAL_MS) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -235,7 +242,8 @@ esp_err_t app_settings_save_and_apply(const app_settings_t *settings,
         return ESP_ERR_INVALID_ARG;
     }
     if (!valid_timing(settings->open_ms) || !valid_timing(settings->close_ms) ||
-        settings->min_command_interval_ms < 50 ||
+        settings->min_command_interval_ms < DEFAULT_MIN_COMMAND_INTERVAL_MS ||
+        settings->min_command_interval_ms > MAX_MIN_COMMAND_INTERVAL_MS ||
         settings->protocol_override > APP_PROTOCOL_SECPLUS_V1_PANEL ||
         settings->obstruction_source > APP_OBSTRUCTION_GPIO) {
         return ESP_ERR_INVALID_ARG;
@@ -255,8 +263,10 @@ esp_err_t app_settings_save_and_apply(const app_settings_t *settings,
                                           (settings->close_ms == 0 && old_settings.close_ms != 0);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_settings = *settings;
-    esp_err_t err = save_settings_locked();
+    esp_err_t err = save_settings_locked(settings);
+    if (err == ESP_OK) {
+        s_settings = *settings;
+    }
     xSemaphoreGive(s_lock);
     if (err != ESP_OK) {
         return err;
@@ -479,11 +489,7 @@ std::string app_settings_build_json(void)
     out += app_admin_pin_configured() ? "true" : "false";
     out += "},\"diagnostics\":{";
     if (have_gdo) {
-        out += "\"client_id\":";
-        out += std::to_string(status.client_id);
-        out += ",\"rolling_code\":";
-        out += std::to_string(status.rolling_code);
-        out += ",\"protocol\":";
+        out += "\"protocol\":";
         append_json_string(out, gdo_protocol_type_to_string(status.protocol));
         out += ",\"synced\":";
         out += status.synced ? "true" : "false";

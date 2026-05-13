@@ -185,8 +185,11 @@ void homekit_task_entry(void* ctx) {
         return;
     }
 
-    hap_init(HAP_TRANSPORT_WIFI);
-    s_homekit_initialized = true;
+    if (hap_init(HAP_TRANSPORT_WIFI) != HAP_SUCCESS) {
+        ESP_LOGE(TAG, "failed to initialize HomeKit");
+        vTaskDelete(NULL);
+        return;
+    }
     hap_register_event_handler(homekit_event_handler);
 
     hap_acc_cfg_t config;
@@ -208,7 +211,7 @@ void homekit_task_entry(void* ctx) {
     gdo_svc = hap_serv_garage_door_opener_create(
             HOMEKIT_CHARACTERISTIC_CURRENT_DOOR_STATE_OPEN,
             HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN,
-            HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR);
+            HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED);
     hap_serv_add_char(gdo_svc, hap_char_name_create(const_cast<char*>("Konnected blaQ")));
     hap_serv_add_char(gdo_svc, hap_char_lock_current_state_create(0));
     hap_serv_add_char(gdo_svc, hap_char_lock_target_state_create(0));
@@ -251,9 +254,11 @@ void homekit_task_entry(void* ctx) {
 
     if (hap_start() != HAP_SUCCESS) {
         ESP_LOGE(TAG, "failed to start HomeKit");
+        s_homekit_initialized = false;
         vTaskDelete(NULL);
         return;
     }
+    s_homekit_initialized = true;
     app_health_mark_homekit_started();
     sync_homekit_from_gdo_status();
 
@@ -302,7 +307,8 @@ void homekit_task_entry(void* ctx) {
                     hap_char_t *charging = hap_serv_get_char_by_uuid(battery_svc, HAP_CHAR_UUID_CHARGING_STATE);
                     hap_char_t *low_battery = hap_serv_get_char_by_uuid(battery_svc, HAP_CHAR_UUID_STATUS_LOW_BATTERY);
                     hap_char_t *fault = hap_serv_get_char_by_uuid(battery_svc, HAP_CHAR_UUID_STATUS_FAULT);
-                    hap_val_t battery_val = {};
+                    hap_val_t battery_val;
+                    battery_val.u = 0;
                     if (battery_level) {
                         battery_val.u = values.level;
                         hap_char_update_val(battery_level, &battery_val);
@@ -421,19 +427,6 @@ GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
     }
 }
 
-static uint8_t map_gdo_to_homekit_target_state(gdo_door_state_t gdo_state) {
-    switch (gdo_state) {
-        case GDO_DOOR_STATE_OPEN:
-        case GDO_DOOR_STATE_OPENING:
-            return TGT_OPEN;
-        case GDO_DOOR_STATE_CLOSED:
-        case GDO_DOOR_STATE_CLOSING:
-            return TGT_CLOSED;
-        default:
-            return TGT_OPEN;
-    }
-}
-
 static void queue_homekit_uint(HomeKitNotifDest dest, uint8_t value, const char *name) {
     GDOEvent e;
     e.dest = dest;
@@ -452,15 +445,13 @@ static void sync_homekit_from_gdo_status(void) {
     }
 
     queue_homekit_uint(HomeKitNotifDest::DoorCurrentState, map_gdo_to_homekit_state(status.door), "initial door current state");
-    queue_homekit_uint(HomeKitNotifDest::DoorTargetState, map_gdo_to_homekit_target_state(status.door), "initial door target state");
+    notify_homekit_target_door_state_change(status.door);
     notify_homekit_current_lock(status.lock);
-    queue_homekit_uint(
-        HomeKitNotifDest::LockTargetState,
-        status.lock == GDO_LOCK_STATE_LOCKED ? HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED : HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED,
-        "initial lock target state");
+    notify_homekit_target_lock(status.lock);
     notify_homekit_obstruction(status.obstruction);
     notify_homekit_light(status.light);
     notify_homekit_motion(status.motion);
+    notify_homekit_battery(status.battery);
 }
 
 // this function is called when the current state of the door changes in the world (i.e. we wish to
@@ -471,6 +462,21 @@ void notify_homekit_current_door_state_change(gdo_door_state_t door) {
     e.value.u = map_gdo_to_homekit_state(door);
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of door current state");
+    }
+}
+
+void notify_homekit_target_door_state_change(gdo_door_state_t door) {
+    switch (door) {
+    case GDO_DOOR_STATE_OPEN:
+    case GDO_DOOR_STATE_OPENING:
+        queue_homekit_uint(HomeKitNotifDest::DoorTargetState, HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN, "door target state");
+        break;
+    case GDO_DOOR_STATE_CLOSED:
+    case GDO_DOOR_STATE_CLOSING:
+        queue_homekit_uint(HomeKitNotifDest::DoorTargetState, HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_CLOSED, "door target state");
+        break;
+    default:
+        break;
     }
 }
 
@@ -516,9 +522,9 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
 void notify_homekit_obstruction(gdo_obstruction_state_t obstructed) {
     GDOEvent e;
     e.dest = HomeKitNotifDest::Obstruction;
-    e.value.b = (obstructed == GDO_OBSTRUCTION_STATE_OBSTRUCTED)
-                  ? HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED
-                  : HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR;
+    e.value.b = (obstructed == GDO_OBSTRUCTION_STATE_CLEAR)
+                  ? HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR
+                  : HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED;
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of door obstructed");
     }
@@ -538,6 +544,14 @@ void notify_homekit_current_lock(gdo_lock_state_t lock) {
     }
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of lock state");
+    }
+}
+
+void notify_homekit_target_lock(gdo_lock_state_t lock) {
+    if (lock == GDO_LOCK_STATE_LOCKED) {
+        queue_homekit_uint(HomeKitNotifDest::LockTargetState, HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED, "lock target state");
+    } else if (lock == GDO_LOCK_STATE_UNLOCKED) {
+        queue_homekit_uint(HomeKitNotifDest::LockTargetState, HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED, "lock target state");
     }
 }
 

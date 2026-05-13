@@ -67,3 +67,34 @@ python tests/hardware_smoke.py \
 - Optional HTTP probe confirms the dashboard responds and, when reachable, validates `/api/status` JSON contains `app`, `gdo`, `wifi`, and `heap` sections.
 - Optional HTTP probe also validates `/api/events`, `/api/settings`, `/api/homekit/setup`, and confirms protected mutation APIs reject missing admin credentials.
 - When `--admin-pin` or `GDO_ADMIN_PIN` is provided, the probe sets or checks the admin PIN and verifies an admin-protected event clear request succeeds.
+
+## Host Protocol Checks
+
+These checks exercise the pure `gdolib/secplus.c` protocol helpers without ESP-IDF hardware dependencies.
+
+CBMC bounded smoke check:
+
+```sh
+cbmc tests/formal/secplus_cbmc_harness.c components/gdolib/secplus.c \
+  -I components/gdolib \
+  --function secplus_smoke_harness \
+  --unwind 40 \
+  --unwinding-assertions \
+  --bounds-check \
+  --pointer-check \
+  --conversion-check \
+  --signed-overflow-check \
+  --unsigned-overflow-check
+```
+
+libFuzzer with ASan/UBSan:
+
+```sh
+/opt/homebrew/opt/llvm/bin/clang -std=c11 -g -O1 \
+  -fsanitize=fuzzer,address,undefined \
+  -Icomponents/gdolib \
+  components/gdolib/secplus.c tests/fuzz/secplus_fuzz.c \
+  -o .cache/analysis/secplus_fuzz
+
+.cache/analysis/secplus_fuzz -runs=10000
+```

@@ -450,22 +450,6 @@ static bool get_admin_pin_from_header(httpd_req_t *req, char *pin, size_t pin_si
     return httpd_req_get_hdr_value_str(req, "X-Admin-PIN", pin, pin_size) == ESP_OK;
 }
 
-static bool get_admin_pin_from_query(httpd_req_t *req, char *pin, size_t pin_size) {
-    size_t query_len = httpd_req_get_url_query_len(req);
-    if (query_len == 0 || query_len >= 128 || pin_size == 0) {
-        return false;
-    }
-
-    char query[128];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-        return false;
-    }
-    if (httpd_query_key_value(query, "pin", pin, pin_size) == ESP_OK) {
-        return true;
-    }
-    return httpd_query_key_value(query, "password", pin, pin_size) == ESP_OK;
-}
-
 static bool get_admin_pin_from_cookie(httpd_req_t *req, char *pin, size_t pin_size) {
     size_t len = httpd_req_get_hdr_value_len(req, "Cookie");
     if (len == 0 || len >= 256 || pin_size == 0) {
@@ -497,7 +481,6 @@ static bool get_admin_pin_from_cookie(httpd_req_t *req, char *pin, size_t pin_si
 
 static bool get_admin_pin_from_request(httpd_req_t *req, char *pin, size_t pin_size) {
     return get_admin_pin_from_header(req, pin, pin_size) ||
-           get_admin_pin_from_query(req, pin, pin_size) ||
            get_admin_pin_from_cookie(req, pin, pin_size);
 }
 
@@ -525,6 +508,15 @@ static esp_err_t require_web_access(httpd_req_t *req) {
     return web_access_allowed(req) ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
+static void set_admin_cookie(httpd_req_t *req, const char *pin) {
+    if (!req || !pin || !pin[0]) {
+        return;
+    }
+    char cookie[128];
+    snprintf(cookie, sizeof(cookie), "gdo_admin_pin=%s; Path=/; SameSite=Strict; HttpOnly", pin);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+}
+
 static bool require_admin(httpd_req_t *req, const std::string *body = nullptr) {
     if (!app_admin_pin_configured()) {
         (void)send_error_response(req, "403 Forbidden", "admin_password_required");
@@ -542,6 +534,10 @@ static bool require_admin(httpd_req_t *req, const std::string *body = nullptr) {
     app_events_log("http", "warn", "admin_auth_failed", "Admin authentication failed", "{}", false);
     (void)send_error_response(req, "403 Forbidden", "bad_admin_password");
     return false;
+}
+
+static esp_err_t require_admin_access(httpd_req_t *req) {
+    return require_admin(req) ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 static bool query_value(httpd_req_t *req, const char *key, char *value, size_t value_size) {
@@ -573,11 +569,6 @@ static size_t query_limit(httpd_req_t *req, size_t default_limit, size_t max_lim
 
 static esp_err_t access_get_handler(httpd_req_t *req) {
     const bool configured = app_admin_pin_configured();
-    bool authenticated = !configured;
-    if (configured) {
-        char pin[ADMIN_PIN_BUFFER_SIZE] = {};
-        authenticated = get_admin_pin_from_request(req, pin, sizeof(pin)) && app_admin_check_pin(pin);
-    }
 
     std::string json;
     json.reserve(96);
@@ -586,7 +577,7 @@ static esp_err_t access_get_handler(httpd_req_t *req) {
     json += ",\"admin_pin_configured\":";
     json += configured ? "true" : "false";
     json += ",\"authenticated\":";
-    json += authenticated ? "true" : "false";
+    json += configured ? "false" : "true";
     json += '}';
     return send_json_response(req, json);
 }
@@ -670,6 +661,7 @@ static esp_err_t admin_setup_post_handler(httpd_req_t *req) {
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "invalid_password", esp_err_to_name(err));
     }
+    set_admin_cookie(req, pin);
     return send_json_response(req, "{\"ok\":true,\"password_configured\":true}");
 }
 
@@ -681,6 +673,11 @@ static esp_err_t admin_check_post_handler(httpd_req_t *req) {
     }
     if (!require_admin(req, &body)) {
         return ESP_OK;
+    }
+    char pin[ADMIN_PIN_BUFFER_SIZE] = {};
+    if (get_admin_pin_from_request(req, pin, sizeof(pin)) ||
+        get_admin_pin_from_body(body, pin, sizeof(pin))) {
+        set_admin_cookie(req, pin);
     }
     return send_json_response(req, "{\"ok\":true,\"authenticated\":true}");
 }
@@ -948,6 +945,7 @@ static esp_err_t app_register_http_handlers(httpd_handle_t server) {
 
 static void app_wifi_start_config_server(int restart_mode) {
     nvs_wifi_connect_set_auth_handler(require_web_access);
+    nvs_wifi_connect_set_write_auth_handler(require_admin_access);
     httpd_handle_t server = nvs_wifi_connect_start_http_server(restart_mode, app_register_http_handlers);
     if (server == nullptr) {
         ESP_LOGE(TAG, "Failed to start WiFi configuration HTTP server");
@@ -960,7 +958,7 @@ static void app_wifi_event_logger(void *arg, esp_event_base_t event_base, int32_
     char data[96];
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
-        snprintf(data, sizeof(data), "{\"reason\":%u}", event ? event->reason : 0);
+        snprintf(data, sizeof(data), "{\"reason\":%d}", event ? static_cast<int>(event->reason) : 0);
         app_events_log("wifi", "warn", "sta_disconnected", "STA Wi-Fi disconnected", data, true);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         auto *event = static_cast<ip_event_got_ip_t *>(event_data);

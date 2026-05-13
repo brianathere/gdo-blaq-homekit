@@ -42,7 +42,9 @@ typedef struct {
 static_assert(sizeof(persisted_events_blob_t) <= 512, "Persisted event blob must stay small for NVS and stack");
 
 static SemaphoreHandle_t s_lock;
-static app_event_record_t s_events[RAM_EVENT_COUNT];
+static SemaphoreHandle_t s_persist_lock;
+static persisted_event_record_t s_events[RAM_EVENT_COUNT];
+static bool s_event_persisted[RAM_EVENT_COUNT];
 static size_t s_event_count;
 static size_t s_event_next;
 static persisted_event_record_t s_critical[CRITICAL_EVENT_COUNT];
@@ -127,6 +129,30 @@ enum : uint16_t {
     EVENT_CODE_GDO_REFRESH,
     EVENT_CODE_MANUAL_SYNC,
     EVENT_CODE_PARTIAL_OPEN,
+    EVENT_CODE_ADMIN_AUTH_FAILED,
+    EVENT_CODE_PAIRING_STARTED,
+    EVENT_CODE_DOOR_COMMAND,
+    EVENT_CODE_LOCK_COMMAND,
+    EVENT_CODE_LIGHT_COMMAND,
+    EVENT_CODE_GDO_SYNCED,
+    EVENT_CODE_DOOR_POSITION,
+    EVENT_CODE_MOTION,
+    EVENT_CODE_LIGHT,
+    EVENT_CODE_LOCK,
+    EVENT_CODE_BATTERY,
+    EVENT_CODE_OPEN_DURATION,
+    EVENT_CODE_CLOSE_DURATION,
+    EVENT_CODE_PAIRED_DEVICES,
+    EVENT_CODE_SYNC,
+    EVENT_CODE_MOTOR,
+    EVENT_CODE_BUTTON,
+    EVENT_CODE_LEARN,
+    EVENT_CODE_OPENINGS,
+    EVENT_CODE_TIME_TO_CLOSE,
+    EVENT_CODE_STA_GOT_IP,
+    EVENT_CODE_AP_CLIENT_CONNECTED,
+    EVENT_CODE_AP_CLIENT_DISCONNECTED,
+    EVENT_CODE_PARTIAL_OPEN_REJECTED,
 };
 
 static const id_name_t CATEGORY_NAMES[] = {
@@ -167,6 +193,30 @@ static const code_meta_t CODE_META[] = {
     {EVENT_CODE_GDO_REFRESH, "gdo_refresh", "GDO status refresh failed"},
     {EVENT_CODE_MANUAL_SYNC, "manual_sync", "Manual GDO sync requested"},
     {EVENT_CODE_PARTIAL_OPEN, "partial_open", "Partial-open command failed"},
+    {EVENT_CODE_ADMIN_AUTH_FAILED, "admin_auth_failed", "Admin authentication failed"},
+    {EVENT_CODE_PAIRING_STARTED, "pairing_started", "HomeKit pairing started"},
+    {EVENT_CODE_DOOR_COMMAND, "door_command", "HomeKit door target requested"},
+    {EVENT_CODE_LOCK_COMMAND, "lock_command", "HomeKit lock target requested"},
+    {EVENT_CODE_LIGHT_COMMAND, "light_command", "HomeKit light requested"},
+    {EVENT_CODE_GDO_SYNCED, "gdo_synced", "GDO synchronized"},
+    {EVENT_CODE_DOOR_POSITION, "door_position", "Door position changed"},
+    {EVENT_CODE_MOTION, "motion", "Motion state changed"},
+    {EVENT_CODE_LIGHT, "light", "Light state changed"},
+    {EVENT_CODE_LOCK, "lock", "Lock state changed"},
+    {EVENT_CODE_BATTERY, "battery", "Battery state changed"},
+    {EVENT_CODE_OPEN_DURATION, "open_duration", "Open duration measured"},
+    {EVENT_CODE_CLOSE_DURATION, "close_duration", "Close duration measured"},
+    {EVENT_CODE_PAIRED_DEVICES, "paired_devices", "Paired device counts changed"},
+    {EVENT_CODE_SYNC, "sync", "GDO sync event received"},
+    {EVENT_CODE_MOTOR, "motor", "Motor state changed"},
+    {EVENT_CODE_BUTTON, "button", "Button state changed"},
+    {EVENT_CODE_LEARN, "learn", "Learn state changed"},
+    {EVENT_CODE_OPENINGS, "openings", "Opening count changed"},
+    {EVENT_CODE_TIME_TO_CLOSE, "time_to_close", "Time-to-close changed"},
+    {EVENT_CODE_STA_GOT_IP, "sta_got_ip", "STA Wi-Fi got IP"},
+    {EVENT_CODE_AP_CLIENT_CONNECTED, "ap_client_connected", "SoftAP client connected"},
+    {EVENT_CODE_AP_CLIENT_DISCONNECTED, "ap_client_disconnected", "SoftAP client disconnected"},
+    {EVENT_CODE_PARTIAL_OPEN_REJECTED, "partial_open_rejected", "Partial-open request rejected"},
 };
 
 static const id_name_t REASON_NAMES[] = {
@@ -212,6 +262,39 @@ static const id_name_t OBSTRUCTION_NAMES[] = {
     {0, "Unknown"},
     {1, "Obstructed"},
     {2, "Clear"},
+};
+
+static const id_name_t DOOR_NAMES[] = {
+    {0, "Unknown"},
+    {1, "Open"},
+    {2, "Closed"},
+    {3, "Stopped"},
+    {4, "Opening"},
+    {5, "Closing"},
+};
+
+static const id_name_t LIGHT_NAMES[] = {
+    {0, "Off"},
+    {1, "On"},
+    {2, "Unknown"},
+};
+
+static const id_name_t LOCK_NAMES[] = {
+    {0, "Unlocked"},
+    {1, "Locked"},
+    {2, "Unknown"},
+};
+
+static const id_name_t MOTION_NAMES[] = {
+    {0, "Clear"},
+    {1, "Detected"},
+    {2, "Unknown"},
+};
+
+static const id_name_t BATTERY_NAMES[] = {
+    {0, "Unknown"},
+    {6, "Charging"},
+    {8, "Full"},
 };
 
 static uint16_t id_for_name(const id_name_t *values, size_t count, const char *name, uint16_t fallback)
@@ -275,6 +358,27 @@ static int32_t json_int_value(const char *json, const char *key, int32_t fallbac
     return (int32_t)strtol(p, NULL, 10);
 }
 
+static int32_t json_bool_value(const char *json, const char *key, int32_t fallback)
+{
+    if (!json || !key) {
+        return fallback;
+    }
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (!p) {
+        return fallback;
+    }
+    p += strlen(pattern);
+    if (strncmp(p, "true", 4) == 0) {
+        return 1;
+    }
+    if (strncmp(p, "false", 5) == 0) {
+        return 0;
+    }
+    return (int32_t)strtol(p, NULL, 10);
+}
+
 static bool json_string_value(const char *json, const char *key, char *out, size_t out_size)
 {
     if (!json || !key || !out || out_size == 0) {
@@ -307,7 +411,7 @@ static uint16_t json_string_id(const char *json, const char *key, const id_name_
     return id_for_name(values, count, value, fallback);
 }
 
-static void append_record_locked(const app_event_record_t *record)
+static void append_record_locked(const persisted_event_record_t *record, bool persisted)
 {
     if (s_event_count == RAM_EVENT_COUNT) {
         ++s_dropped_events;
@@ -315,6 +419,7 @@ static void append_record_locked(const app_event_record_t *record)
         ++s_event_count;
     }
     s_events[s_event_next] = *record;
+    s_event_persisted[s_event_next] = persisted;
     s_event_next = (s_event_next + 1) % RAM_EVENT_COUNT;
 
     if (record->seq >= s_next_seq) {
@@ -389,17 +494,54 @@ static persisted_event_record_t encode_persisted_record(const app_event_record_t
         out.value1 = json_int_value(record->data_json, "reason", 0);
         break;
     case EVENT_CODE_GDO_SYNC_FAILED:
+    case EVENT_CODE_GDO_SYNCED:
         out.value1 = json_string_id(record->data_json, "protocol", PROTOCOL_NAMES,
                                     sizeof(PROTOCOL_NAMES) / sizeof(PROTOCOL_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_DOOR_POSITION:
+        out.value1 = json_string_id(record->data_json, "door", DOOR_NAMES,
+                                    sizeof(DOOR_NAMES) / sizeof(DOOR_NAMES[0]), 0);
+        out.value2 = json_int_value(record->data_json, "position", -1);
+        out.value3 = json_int_value(record->data_json, "target", -1);
         break;
     case EVENT_CODE_OBSTRUCTION:
         out.value1 = json_string_id(record->data_json, "obstruction", OBSTRUCTION_NAMES,
                                     sizeof(OBSTRUCTION_NAMES) / sizeof(OBSTRUCTION_NAMES[0]), 0);
         break;
+    case EVENT_CODE_MOTION:
+        out.value1 = json_string_id(record->data_json, "motion", MOTION_NAMES,
+                                    sizeof(MOTION_NAMES) / sizeof(MOTION_NAMES[0]), 2);
+        break;
+    case EVENT_CODE_LIGHT:
+        out.value1 = json_string_id(record->data_json, "light", LIGHT_NAMES,
+                                    sizeof(LIGHT_NAMES) / sizeof(LIGHT_NAMES[0]), 2);
+        break;
+    case EVENT_CODE_LOCK:
+        out.value1 = json_string_id(record->data_json, "lock", LOCK_NAMES,
+                                    sizeof(LOCK_NAMES) / sizeof(LOCK_NAMES[0]), 2);
+        break;
+    case EVENT_CODE_BATTERY:
+        out.value1 = json_string_id(record->data_json, "battery", BATTERY_NAMES,
+                                    sizeof(BATTERY_NAMES) / sizeof(BATTERY_NAMES[0]), 0);
+        break;
+    case EVENT_CODE_DOOR_COMMAND:
+    case EVENT_CODE_LOCK_COMMAND:
+        out.value1 = json_int_value(record->data_json, "target", -1);
+        break;
+    case EVENT_CODE_LIGHT_COMMAND:
+        out.value1 = json_bool_value(record->data_json, "on", 0);
+        break;
+    case EVENT_CODE_OPEN_DURATION:
+        out.value1 = json_int_value(record->data_json, "open_ms", 0);
+        break;
+    case EVENT_CODE_CLOSE_DURATION:
+        out.value1 = json_int_value(record->data_json, "close_ms", 0);
+        break;
+    case EVENT_CODE_PAIRED_DEVICES:
+        out.value1 = json_int_value(record->data_json, "total", -1);
+        break;
     case EVENT_CODE_ROLLING_CODE_RECOVERY:
-        out.value1 = json_int_value(record->data_json, "old", 0);
-        out.value2 = json_int_value(record->data_json, "new", 0);
-        out.value3 = json_int_value(record->data_json, "attempt", 0);
+        out.value1 = json_int_value(record->data_json, "attempt", 0);
         break;
     case EVENT_CODE_GDO_REFRESH:
     case EVENT_CODE_MANUAL_SYNC:
@@ -419,7 +561,7 @@ static persisted_event_record_t encode_persisted_record(const app_event_record_t
     return out;
 }
 
-static void decode_persisted_record(const persisted_event_record_t *record, app_event_record_t *out)
+static void decode_compact_record(const persisted_event_record_t *record, bool persisted, app_event_record_t *out)
 {
     if (!record || !out) {
         return;
@@ -429,7 +571,7 @@ static void decode_persisted_record(const persisted_event_record_t *record, app_
     const code_meta_t *meta = code_meta_for_id(record->code_id);
     out->seq = record->seq;
     out->time_ms = record->time_ms;
-    out->persisted = true;
+    out->persisted = persisted;
     copy_text(out->category, sizeof(out->category),
               name_for_id(CATEGORY_NAMES, sizeof(CATEGORY_NAMES) / sizeof(CATEGORY_NAMES[0]),
                           record->category_id, "app"));
@@ -442,14 +584,14 @@ static void decode_persisted_record(const persisted_event_record_t *record, app_
     switch (record->code_id) {
     case EVENT_CODE_RESET: {
         const char *reason = name_for_id(REASON_NAMES, sizeof(REASON_NAMES) / sizeof(REASON_NAMES[0]),
-                                         (uint16_t)record->value1, "unknown");
+                                         static_cast<uint16_t>(record->value1), "unknown");
         snprintf(out->message, sizeof(out->message), "Boot reset reason: %s", reason);
         snprintf(out->data_json, sizeof(out->data_json), "{\"reason\":\"%s\"}", reason);
         break;
     }
     case EVENT_CODE_HEALTH_REBOOT: {
         const char *reason = name_for_id(REASON_NAMES, sizeof(REASON_NAMES) / sizeof(REASON_NAMES[0]),
-                                         (uint16_t)record->value1, "unknown");
+                                         static_cast<uint16_t>(record->value1), "unknown");
         snprintf(out->data_json, sizeof(out->data_json), "{\"reason\":\"%s\"}", reason);
         break;
     }
@@ -458,33 +600,86 @@ static void decode_persisted_record(const persisted_event_record_t *record, app_
         break;
     case EVENT_CODE_GDO_SYNC_FAILED: {
         const char *protocol = name_for_id(PROTOCOL_NAMES, sizeof(PROTOCOL_NAMES) / sizeof(PROTOCOL_NAMES[0]),
-                                           (uint16_t)record->value1, "Unknown");
+                                           static_cast<uint16_t>(record->value1), "Unknown");
         snprintf(out->data_json, sizeof(out->data_json), "{\"synced\":false,\"protocol\":\"%s\"}", protocol);
+        break;
+    }
+    case EVENT_CODE_GDO_SYNCED: {
+        const char *protocol = name_for_id(PROTOCOL_NAMES, sizeof(PROTOCOL_NAMES) / sizeof(PROTOCOL_NAMES[0]),
+                                           static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"synced\":true,\"protocol\":\"%s\"}", protocol);
+        break;
+    }
+    case EVENT_CODE_DOOR_POSITION: {
+        const char *door = name_for_id(DOOR_NAMES, sizeof(DOOR_NAMES) / sizeof(DOOR_NAMES[0]),
+                                       static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json),
+                 "{\"door\":\"%s\",\"position\":%" PRId32 ",\"target\":%" PRId32 "}",
+                 door, record->value2, record->value3);
         break;
     }
     case EVENT_CODE_OBSTRUCTION: {
         const char *obstruction = name_for_id(OBSTRUCTION_NAMES, sizeof(OBSTRUCTION_NAMES) / sizeof(OBSTRUCTION_NAMES[0]),
-                                              (uint16_t)record->value1, "Unknown");
+                                              static_cast<uint16_t>(record->value1), "Unknown");
         snprintf(out->data_json, sizeof(out->data_json), "{\"obstruction\":\"%s\"}", obstruction);
         break;
     }
+    case EVENT_CODE_MOTION: {
+        const char *motion = name_for_id(MOTION_NAMES, sizeof(MOTION_NAMES) / sizeof(MOTION_NAMES[0]),
+                                         static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"motion\":\"%s\"}", motion);
+        break;
+    }
+    case EVENT_CODE_LIGHT: {
+        const char *light = name_for_id(LIGHT_NAMES, sizeof(LIGHT_NAMES) / sizeof(LIGHT_NAMES[0]),
+                                        static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"light\":\"%s\"}", light);
+        break;
+    }
+    case EVENT_CODE_LOCK: {
+        const char *lock = name_for_id(LOCK_NAMES, sizeof(LOCK_NAMES) / sizeof(LOCK_NAMES[0]),
+                                       static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"lock\":\"%s\"}", lock);
+        break;
+    }
+    case EVENT_CODE_BATTERY: {
+        const char *battery = name_for_id(BATTERY_NAMES, sizeof(BATTERY_NAMES) / sizeof(BATTERY_NAMES[0]),
+                                          static_cast<uint16_t>(record->value1), "Unknown");
+        snprintf(out->data_json, sizeof(out->data_json), "{\"battery\":\"%s\"}", battery);
+        break;
+    }
+    case EVENT_CODE_DOOR_COMMAND:
+    case EVENT_CODE_LOCK_COMMAND:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"target\":%" PRId32 "}", record->value1);
+        break;
+    case EVENT_CODE_LIGHT_COMMAND:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"on\":%s}", record->value1 ? "true" : "false");
+        break;
+    case EVENT_CODE_OPEN_DURATION:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"open_ms\":%" PRId32 "}", record->value1);
+        break;
+    case EVENT_CODE_CLOSE_DURATION:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"close_ms\":%" PRId32 "}", record->value1);
+        break;
+    case EVENT_CODE_PAIRED_DEVICES:
+        snprintf(out->data_json, sizeof(out->data_json), "{\"total\":%" PRId32 "}", record->value1);
+        break;
     case EVENT_CODE_ROLLING_CODE_RECOVERY:
         snprintf(out->data_json, sizeof(out->data_json),
-                 "{\"old\":%" PRId32 ",\"new\":%" PRId32 ",\"attempt\":%" PRId32 "}",
-                 record->value1, record->value2, record->value3);
+                 "{\"attempt\":%" PRId32 "}", record->value3 ? record->value3 : record->value1);
         break;
     case EVENT_CODE_GDO_REFRESH:
     case EVENT_CODE_MANUAL_SYNC:
     case EVENT_CODE_HEALTH_RESYNC_FAILED:
     case EVENT_CODE_HEALTH_STATUS_FAILED: {
         const char *result = name_for_id(RESULT_NAMES, sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]),
-                                         (uint16_t)record->value1, "unknown");
+                                         static_cast<uint16_t>(record->value1), "unknown");
         snprintf(out->data_json, sizeof(out->data_json), "{\"result\":\"%s\"}", result);
         break;
     }
     case EVENT_CODE_PARTIAL_OPEN: {
         const char *result = name_for_id(RESULT_NAMES, sizeof(RESULT_NAMES) / sizeof(RESULT_NAMES[0]),
-                                         (uint16_t)record->value2, "unknown");
+                                         static_cast<uint16_t>(record->value2), "unknown");
         snprintf(out->data_json, sizeof(out->data_json), "{\"target_percent\":%" PRId32 ",\"result\":\"%s\"}",
                  record->value1, result);
         break;
@@ -501,6 +696,9 @@ static void save_critical_events(void)
     blob.magic = EVENTS_BLOB_MAGIC;
     blob.version = EVENTS_BLOB_VERSION;
 
+    if (s_persist_lock) {
+        xSemaphoreTake(s_persist_lock, portMAX_DELAY);
+    }
     if (s_lock) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         blob.count = (uint32_t)s_critical_count;
@@ -510,17 +708,20 @@ static void save_critical_events(void)
     }
 
     esp_err_t err = write_critical_events_blob(&blob);
+    if (s_persist_lock) {
+        xSemaphoreGive(s_persist_lock);
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Unable to persist diagnostics events: %s", esp_err_to_name(err));
     }
 }
 
-static void add_critical_locked(const app_event_record_t *record)
+static void add_critical_locked(const persisted_event_record_t *record)
 {
     if (s_critical_count < CRITICAL_EVENT_COUNT) {
         ++s_critical_count;
     }
-    s_critical[s_critical_next] = encode_persisted_record(record);
+    s_critical[s_critical_next] = *record;
     s_critical_next = (s_critical_next + 1) % CRITICAL_EVENT_COUNT;
 }
 
@@ -585,6 +786,12 @@ esp_err_t app_events_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    if (!s_persist_lock) {
+        s_persist_lock = xSemaphoreCreateMutex();
+        if (!s_persist_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_initialized) {
@@ -608,9 +815,7 @@ esp_err_t app_events_init(void)
             memcpy(s_critical, blob.records, sizeof(s_critical));
             for (size_t i = 0; i < s_critical_count; ++i) {
                 size_t idx = (s_critical_next + CRITICAL_EVENT_COUNT - s_critical_count + i) % CRITICAL_EVENT_COUNT;
-                app_event_record_t decoded = {};
-                decode_persisted_record(&s_critical[idx], &decoded);
-                append_record_locked(&decoded);
+                append_record_locked(&s_critical[idx], true);
             }
         } else if (err != ESP_ERR_NVS_NOT_FOUND) {
             erase_stale_blob = true;
@@ -645,11 +850,12 @@ void app_events_log(const char *category, const char *severity, const char *code
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     record.seq = s_next_seq++;
+    persisted_event_record_t compact = encode_persisted_record(&record);
     if (should_persist) {
         record.persisted = true;
-        add_critical_locked(&record);
+        add_critical_locked(&compact);
     }
-    append_record_locked(&record);
+    append_record_locked(&compact, should_persist);
     xSemaphoreGive(s_lock);
 
     if (should_persist) {
@@ -674,8 +880,10 @@ esp_err_t app_events_clear(void)
         return ESP_ERR_NO_MEM;
     }
 
+    xSemaphoreTake(s_persist_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memset(s_events, 0, sizeof(s_events));
+    memset(s_event_persisted, 0, sizeof(s_event_persisted));
     memset(s_critical, 0, sizeof(s_critical));
     s_event_count = 0;
     s_event_next = 0;
@@ -697,6 +905,7 @@ esp_err_t app_events_clear(void)
         nvs_close(nvs);
         err = erase_err;
     }
+    xSemaphoreGive(s_persist_lock);
     return err;
 }
 
@@ -717,7 +926,7 @@ void app_events_get_summary(app_events_summary_t *summary)
     if (s_critical_count > 0) {
         size_t idx = (s_critical_next + CRITICAL_EVENT_COUNT - 1) % CRITICAL_EVENT_COUNT;
         summary->has_last_critical = true;
-        decode_persisted_record(&s_critical[idx], &summary->last_critical);
+        decode_compact_record(&s_critical[idx], true, &summary->last_critical);
     }
     xSemaphoreGive(s_lock);
 }
@@ -734,18 +943,26 @@ std::string app_events_build_json(size_t limit, const char *category, const char
     std::string out;
     out.reserve(2048 + (limit * 160));
     out += "{\"events\":[";
+    const uint16_t category_filter = (category && category[0])
+        ? id_for_name(CATEGORY_NAMES, sizeof(CATEGORY_NAMES) / sizeof(CATEGORY_NAMES[0]), category, UINT16_MAX)
+        : UINT16_MAX;
+    const uint16_t severity_filter = (severity && severity[0])
+        ? id_for_name(SEVERITY_NAMES, sizeof(SEVERITY_NAMES) / sizeof(SEVERITY_NAMES[0]), severity, UINT16_MAX)
+        : UINT16_MAX;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     size_t emitted = 0;
     for (size_t i = 0; i < s_event_count && emitted < limit; ++i) {
         size_t idx = (s_event_next + RAM_EVENT_COUNT - 1 - i) % RAM_EVENT_COUNT;
-        const app_event_record_t &event = s_events[idx];
-        if (category && category[0] && strcmp(event.category, category) != 0) {
+        const persisted_event_record_t &compact = s_events[idx];
+        if (category_filter != UINT16_MAX && compact.category_id != category_filter) {
             continue;
         }
-        if (severity && severity[0] && strcmp(event.severity, severity) != 0) {
+        if (severity_filter != UINT16_MAX && compact.severity_id != severity_filter) {
             continue;
         }
+        app_event_record_t event = {};
+        decode_compact_record(&compact, s_event_persisted[idx], &event);
         if (emitted > 0) {
             out += ',';
         }

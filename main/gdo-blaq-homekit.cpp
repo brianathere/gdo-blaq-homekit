@@ -1,3 +1,5 @@
+#include <inttypes.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -113,15 +115,15 @@ static void log_gdo_event(const gdo_status_t *status, gdo_cb_event_t event)
         app_events_log("gdo", "info", "battery", "Battery state changed", data, false);
         break;
     case GDO_CB_EVENT_OPEN_DURATION_MEASUREMENT:
-        snprintf(data, sizeof(data), "{\"open_ms\":%u}", status->open_ms);
+        snprintf(data, sizeof(data), "{\"open_ms\":%" PRIu16 "}", status->open_ms);
         app_events_log("gdo", "info", "open_duration", "Open duration measured", data, false);
         break;
     case GDO_CB_EVENT_CLOSE_DURATION_MEASUREMENT:
-        snprintf(data, sizeof(data), "{\"close_ms\":%u}", status->close_ms);
+        snprintf(data, sizeof(data), "{\"close_ms\":%" PRIu16 "}", status->close_ms);
         app_events_log("gdo", "info", "close_duration", "Close duration measured", data, false);
         break;
     case GDO_CB_EVENT_PAIRED_DEVICES:
-        snprintf(data, sizeof(data), "{\"total\":%u}", status->paired_devices.total_all);
+        snprintf(data, sizeof(data), "{\"total\":%u}", (unsigned)status->paired_devices.total_all);
         app_events_log("gdo", "info", "paired_devices", "Paired device counts changed", data, false);
         break;
     default:
@@ -165,11 +167,10 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
                 ESP_LOGW(TAG,
                          "GDO sync failed; rolling code advanced from %" PRIu32 " to %" PRIu32
                          " for recovery attempt %u/%u",
-                         old_rolling_code, new_rolling_code, s_rolling_code_recovery_attempts,
-                         MAX_ROLLING_CODE_RECOVERY_ATTEMPTS);
+                         old_rolling_code, new_rolling_code, (unsigned)s_rolling_code_recovery_attempts,
+                         (unsigned)MAX_ROLLING_CODE_RECOVERY_ATTEMPTS);
                 char data[96];
-                snprintf(data, sizeof(data), "{\"old\":%" PRIu32 ",\"new\":%" PRIu32 ",\"attempt\":%u}",
-                         old_rolling_code, new_rolling_code, s_rolling_code_recovery_attempts);
+                snprintf(data, sizeof(data), "{\"attempt\":%u}", (unsigned)s_rolling_code_recovery_attempts);
                 app_events_log("gdo", "warn", "rolling_code_recovery",
                                "Rolling code advanced for sync recovery", data, true);
                 esp_err_t err = gdo_sync();
@@ -179,7 +180,7 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
             }
         } else {
             ESP_LOGW(TAG, "GDO sync failed; leaving rolling code unchanged after %u recovery attempts",
-                     s_rolling_code_recovery_attempts);
+                     (unsigned)s_rolling_code_recovery_attempts);
         }
         break;
     case GDO_CB_EVENT_LIGHT:
@@ -189,11 +190,13 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
     case GDO_CB_EVENT_LOCK:
         ESP_LOGI(TAG, "Lock: %s", gdo_lock_state_to_string(status->lock));
         notify_homekit_current_lock(status->lock);
+        notify_homekit_target_lock(status->lock);
         break;
     case GDO_CB_EVENT_DOOR_POSITION:
         ESP_LOGI(TAG, "Door: %s, %.2f%%, target: %.2f%%", gdo_door_state_to_string(status->door),
                  (float)status->door_position, (float)status->door_target);
         notify_homekit_current_door_state_change(status->door);
+        notify_homekit_target_door_state_change(status->door);
         break;
     case GDO_CB_EVENT_LEARN:
         ESP_LOGI(TAG, "Learn: %s", gdo_learn_state_to_string(status->learn));
