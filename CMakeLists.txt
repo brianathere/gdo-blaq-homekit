@@ -10,3 +10,5 @@ set(EXTRA_COMPONENT_DIRS ${HOMEKIT_PATH}/components ${HOMEKIT_PATH}/components/h
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(gdo-blaq-homekit)
+
+target_link_libraries(${project_elf} PRIVATE "-Wl,--wrap=esp_panic_handler")

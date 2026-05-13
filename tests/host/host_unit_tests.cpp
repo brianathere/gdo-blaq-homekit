@@ -144,9 +144,23 @@ static void test_settings_and_admin_pin(void)
     assert(status.toggle_only);
     assert(last_rx_ms == 1000);
 
+    assert(app_settings_save_secplus_identity(0x12345678, 0x01020304) == ESP_OK);
+    app_settings_get(&settings);
+    assert(settings.secplus_identity_configured);
+    assert(settings.secplus_client_id == 0x12345678);
+    assert(settings.secplus_rolling_code == 0x01020304);
+
+    host_gdo_reset();
+    assert(app_settings_apply_gdo_pre_start(&settings) == ESP_OK);
+    host_gdo_get_applied_settings(&status, nullptr);
+    assert(status.client_id == 0x12345678);
+    assert(status.rolling_code == 0x01020304);
+
     std::string json = app_settings_build_json();
     assert(json.find("\"pin_configured\":true") != std::string::npos);
     assert(json.find("\"protocol\":\"Security+ 2.0\"") != std::string::npos);
+    assert(json.find("\"secplus_identity_configured\":true") != std::string::npos);
+    assert(json.find("\"secplus_client_id\":305419896") != std::string::npos);
 }
 
 int main(void)

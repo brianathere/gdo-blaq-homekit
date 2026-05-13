@@ -329,7 +329,7 @@ static std::string build_status_json(void) {
     const uint32_t now = millis();
     const esp_app_desc_t *app_desc = esp_app_get_description();
     std::string out;
-    out.reserve(4096);
+    out.reserve(5120);
     bool root_first = true;
 
     out += '{';
@@ -346,6 +346,7 @@ static std::string build_status_json(void) {
     json_prop_format(out, app_first, "uptime_ms", "%" PRIu32, now);
     json_prop_string(out, app_first, "reset_reason", app_health_reset_reason_to_string(esp_reset_reason()));
     json_prop_bool(out, app_first, "homekit_started", health.homekit_started);
+    json_prop_bool(out, app_first, "panic_tx_guard_enabled", true);
     json_prop_format(out, app_first, "health_started_ms", "%" PRIu32, health.started_ms);
     json_prop_format(out, app_first, "last_gdo_event_ms", "%" PRIu32, health.last_gdo_event_ms);
     if (health.last_gdo_event_ms) {
@@ -388,6 +389,14 @@ static std::string build_status_json(void) {
     json_prop_format(out, settings_first, "close_ms", "%u", settings.close_ms);
     json_prop_format(out, settings_first, "min_command_interval_ms", "%" PRIu32, settings.min_command_interval_ms);
     json_prop_bool(out, settings_first, "toggle_only", settings.toggle_only);
+    json_prop_bool(out, settings_first, "secplus_identity_configured", settings.secplus_identity_configured);
+    if (settings.secplus_identity_configured) {
+        json_prop_format(out, settings_first, "secplus_client_id", "%" PRIu32, settings.secplus_client_id);
+        json_prop_format(out, settings_first, "secplus_rolling_code", "%" PRIu32, settings.secplus_rolling_code);
+    } else {
+        json_prop_null(out, settings_first, "secplus_client_id");
+        json_prop_null(out, settings_first, "secplus_rolling_code");
+    }
     json_prop_bool(out, settings_first, "admin_pin_configured", app_admin_pin_configured());
     out += '}';
 
@@ -444,6 +453,13 @@ static std::string build_status_json(void) {
         const uint32_t last_rx_ms = gdo_get_last_rx_ms();
         json_prop_bool(out, gdo_first, "synced", status.synced);
         json_prop_string(out, gdo_first, "protocol", gdo_protocol_type_to_string(status.protocol));
+        if (status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+            json_prop_format(out, gdo_first, "client_id", "%" PRIu32, status.client_id);
+            json_prop_format(out, gdo_first, "rolling_code", "%" PRIu32, status.rolling_code);
+        } else {
+            json_prop_null(out, gdo_first, "client_id");
+            json_prop_null(out, gdo_first, "rolling_code");
+        }
         json_prop_string(out, gdo_first, "door", gdo_door_state_to_string(status.door));
         json_prop_string(out, gdo_first, "light", gdo_light_state_to_string(status.light));
         json_prop_string(out, gdo_first, "lock", gdo_lock_state_to_string(status.lock));
@@ -455,6 +471,14 @@ static std::string build_status_json(void) {
         json_prop_string(out, gdo_first, "learn", gdo_learn_state_to_string(status.learn));
         json_prop_string(out, gdo_first, "last_move_direction", gdo_door_state_to_string(status.last_move_direction));
         json_prop_bool(out, gdo_first, "toggle_only", status.toggle_only);
+        json_prop_bool(out, gdo_first, "door_moving",
+                       status.door == GDO_DOOR_STATE_OPENING || status.door == GDO_DOOR_STATE_CLOSING);
+        json_prop_bool(out, gdo_first, "motor_running", status.motor == GDO_MOTOR_STATE_ON);
+        json_prop_bool(out, gdo_first, "wall_button_pressed", status.button == GDO_BUTTON_STATE_PRESSED);
+        json_prop_bool(out, gdo_first, "obstruction_detected", status.obstruction == GDO_OBSTRUCTION_STATE_OBSTRUCTED);
+        json_prop_bool(out, gdo_first, "motion_detected", status.motion == GDO_MOTION_STATE_DETECTED);
+        json_prop_bool(out, gdo_first, "learn_active", status.learn == GDO_LEARN_STATE_ACTIVE);
+        json_prop_bool(out, gdo_first, "remote_lock_locked", status.lock == GDO_LOCK_STATE_LOCKED);
         add_position_or_null(out, gdo_first, "door_position_percent", status.door_position);
         add_position_or_null(out, gdo_first, "door_target_percent", status.door_target);
         const bool door_moving = status.door == GDO_DOOR_STATE_OPENING || status.door == GDO_DOOR_STATE_CLOSING;
@@ -516,6 +540,23 @@ static std::string build_status_json(void) {
     json_prop_string(out, homekit_first, "model", "GDO blaQ HomeKit");
     json_prop_string(out, homekit_first, "hardware_revision", CONFIG_IDF_TARGET);
     json_prop_string(out, homekit_first, "firmware_revision", app_desc ? app_desc->version : "");
+    bool services_first = true;
+    json_object_start(out, homekit_first, "services", services_first);
+    json_prop_string(out, services_first, "door", "garage_door_opener");
+    json_prop_string(out, services_first, "obstruction", "garage_door_obstruction");
+    json_prop_string(out, services_first, "light", "lightbulb");
+    json_prop_string(out, services_first, "motion", "motion_sensor");
+    json_prop_string(out, services_first, "battery", "battery_service");
+    json_prop_string(out, services_first, "remote_lock", "lock_mechanism");
+    json_prop_string(out, services_first, "wall_button", "stateless_programmable_switch");
+    out += '}';
+    bool not_shared_first = true;
+    json_object_start(out, homekit_first, "not_shared", not_shared_first);
+    json_prop_string(out, not_shared_first, "client_id", "diagnostic_only");
+    json_prop_string(out, not_shared_first, "rolling_code", "diagnostic_only");
+    json_prop_string(out, not_shared_first, "gdo_sync", "web_ui_only");
+    json_prop_string(out, not_shared_first, "learn_mode", "web_ui_only");
+    out += '}';
     out += '}';
 
     out += '}';

@@ -25,6 +25,9 @@ typedef struct {
     uint16_t close_ms;
     uint32_t min_command_interval_ms;
     bool toggle_only;
+    bool secplus_identity_configured;
+    uint32_t secplus_client_id;
+    uint32_t secplus_rolling_code;
 } app_settings_t;
 
 typedef struct {
@@ -40,6 +43,7 @@ esp_err_t app_settings_save_and_apply(const app_settings_t *settings,
                                       app_settings_apply_result_t *result);
 esp_err_t app_settings_apply_gdo_runtime(const app_settings_t *settings);
 esp_err_t app_settings_apply_gdo_pre_start(const app_settings_t *settings);
+esp_err_t app_settings_save_secplus_identity(uint32_t client_id, uint32_t rolling_code);
 
 const char *app_protocol_override_to_string(app_protocol_override_t value);
 esp_err_t app_protocol_override_from_string(const char *value, app_protocol_override_t *out);

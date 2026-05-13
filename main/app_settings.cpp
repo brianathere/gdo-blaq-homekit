@@ -17,6 +17,7 @@ static const char *TAG = "app_settings";
 
 static constexpr uint32_t DEFAULT_MIN_COMMAND_INTERVAL_MS = 50;
 static constexpr uint32_t MAX_MIN_COMMAND_INTERVAL_MS = 60000;
+static constexpr uint32_t MAX_SECPLUS_V2_ROLLING_CODE = 0x0fffffff;
 static constexpr size_t ADMIN_SALT_SIZE = 16;
 static constexpr size_t ADMIN_HASH_SIZE = 32;
 static constexpr size_t ADMIN_PASSWORD_MAX_SIZE = 64;
@@ -29,6 +30,9 @@ static app_settings_t s_settings = {
     .close_ms = 0,
     .min_command_interval_ms = DEFAULT_MIN_COMMAND_INTERVAL_MS,
     .toggle_only = false,
+    .secplus_identity_configured = false,
+    .secplus_client_id = 0,
+    .secplus_rolling_code = 0,
 };
 static bool s_pin_configured;
 static uint8_t s_pin_salt[ADMIN_SALT_SIZE];
@@ -106,6 +110,15 @@ static esp_err_t save_settings_locked(const app_settings_t *settings)
         err = nvs_set_u8(nvs, "toggle_only", settings->toggle_only ? 1 : 0);
     }
     if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "sp_id_ok", settings->secplus_identity_configured ? 1 : 0);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "sp_client", settings->secplus_client_id);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "sp_roll", settings->secplus_rolling_code);
+    }
+    if (err == ESP_OK) {
         err = nvs_commit(nvs);
     }
     nvs_close(nvs);
@@ -140,6 +153,17 @@ static esp_err_t load_settings(void)
     uint8_t toggle = 0;
     if (nvs_get_u8(nvs, "toggle_only", &toggle) == ESP_OK) {
         s_settings.toggle_only = toggle != 0;
+    }
+    uint8_t identity_configured = 0;
+    uint32_t client_id = 0;
+    uint32_t rolling_code = 0;
+    if (nvs_get_u8(nvs, "sp_id_ok", &identity_configured) == ESP_OK && identity_configured != 0 &&
+        nvs_get_u32(nvs, "sp_client", &client_id) == ESP_OK &&
+        nvs_get_u32(nvs, "sp_roll", &rolling_code) == ESP_OK &&
+        rolling_code <= MAX_SECPLUS_V2_ROLLING_CODE) {
+        s_settings.secplus_identity_configured = true;
+        s_settings.secplus_client_id = client_id;
+        s_settings.secplus_rolling_code = rolling_code;
     }
 
     size_t salt_len = sizeof(s_pin_salt);
@@ -196,6 +220,19 @@ esp_err_t app_settings_apply_gdo_pre_start(const app_settings_t *settings)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Unable to apply protocol override: %s", esp_err_to_name(err));
             return err;
+        }
+    }
+    if (settings->secplus_identity_configured) {
+        esp_err_t id_err = gdo_set_client_id(settings->secplus_client_id);
+        if (id_err != ESP_OK) {
+            ESP_LOGW(TAG, "Unable to restore Security+ client ID: %s", esp_err_to_name(id_err));
+        }
+        esp_err_t rolling_err = gdo_set_rolling_code(settings->secplus_rolling_code);
+        if (rolling_err != ESP_OK) {
+            ESP_LOGW(TAG, "Unable to restore Security+ rolling code: %s", esp_err_to_name(rolling_err));
+        }
+        if (id_err == ESP_OK && rolling_err == ESP_OK) {
+            ESP_LOGI(TAG, "Restored Security+ identity from NVS");
         }
     }
     return app_settings_apply_gdo_runtime(settings);
@@ -358,6 +395,59 @@ esp_err_t app_obstruction_source_from_string(const char *value, app_obstruction_
     return ESP_OK;
 }
 
+esp_err_t app_settings_save_secplus_identity(uint32_t client_id, uint32_t rolling_code)
+{
+    if (rolling_code > MAX_SECPLUS_V2_ROLLING_CODE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_lock) {
+        esp_err_t init_err = app_settings_init();
+        if (init_err != ESP_OK) {
+            return init_err;
+        }
+    }
+
+    bool changed = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_settings.secplus_identity_configured &&
+        s_settings.secplus_client_id == client_id &&
+        s_settings.secplus_rolling_code == rolling_code) {
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open("gdo_app", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "sp_id_ok", 1);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "sp_client", client_id);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs, "sp_roll", rolling_code);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    if (nvs) {
+        nvs_close(nvs);
+    }
+    if (err == ESP_OK) {
+        s_settings.secplus_identity_configured = true;
+        s_settings.secplus_client_id = client_id;
+        s_settings.secplus_rolling_code = rolling_code;
+        changed = true;
+    }
+    xSemaphoreGive(s_lock);
+
+    if (changed) {
+        app_events_log("settings", "info", "secplus_identity_saved",
+                       "Security+ identity persisted", "{}", false);
+    }
+    return err;
+}
+
 bool app_admin_pin_configured(void)
 {
     if (!s_lock) {
@@ -483,6 +573,20 @@ std::string app_settings_build_json(void)
     out += std::to_string(settings.min_command_interval_ms);
     out += ",\"toggle_only\":";
     out += settings.toggle_only ? "true" : "false";
+    out += ",\"secplus_identity_configured\":";
+    out += settings.secplus_identity_configured ? "true" : "false";
+    out += ",\"secplus_client_id\":";
+    if (settings.secplus_identity_configured) {
+        out += std::to_string(settings.secplus_client_id);
+    } else {
+        out += "null";
+    }
+    out += ",\"secplus_rolling_code\":";
+    if (settings.secplus_identity_configured) {
+        out += std::to_string(settings.secplus_rolling_code);
+    } else {
+        out += "null";
+    }
     out += "},\"bounds\":{\"open_ms\":{\"min\":0,\"max\":65000},\"close_ms\":{\"min\":0,\"max\":65000},\"min_command_interval_ms\":{\"min\":50,\"max\":60000}},";
     out += "\"admin\":{\"pin_configured\":";
     out += app_admin_pin_configured() ? "true" : "false";
@@ -494,6 +598,10 @@ std::string app_settings_build_json(void)
         out += status.synced ? "true" : "false";
         out += ",\"last_rx_ms\":";
         out += std::to_string(last_rx_ms);
+        out += ",\"client_id\":";
+        out += std::to_string(status.client_id);
+        out += ",\"rolling_code\":";
+        out += std::to_string(status.rolling_code);
     } else {
         out += "\"error\":\"gdo_get_status failed\"";
     }

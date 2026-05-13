@@ -15,6 +15,7 @@ void notify_homekit_target_lock(gdo_lock_state_t lock);
 void notify_homekit_light(gdo_light_state_t light);
 void notify_homekit_motion(gdo_motion_state_t motion);
 void notify_homekit_battery(gdo_battery_state_t battery);
+void notify_homekit_wall_button(gdo_button_state_t button);
 
 int homekit_paired_controller_count(void);
 char *homekit_setup_payload(void);

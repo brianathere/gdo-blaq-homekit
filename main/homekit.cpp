@@ -51,6 +51,7 @@ enum class HomeKitNotifDest {
     Light,
     Motion,
     Battery,
+    WallButton,
 };
 
 struct GDOEvent {
@@ -71,6 +72,7 @@ static constexpr uint8_t HAP_CHARGING_NOT_CHARGEABLE = 2;
 static constexpr uint8_t HAP_LOW_BATTERY_NORMAL = 0;
 static constexpr uint8_t HAP_STATUS_FAULT_NONE = 0;
 static constexpr uint8_t HAP_STATUS_FAULT_GENERAL = 1;
+static constexpr uint8_t HAP_PROGRAMMABLE_SWITCH_SINGLE_PRESS = 0;
 
 typedef struct {
     uint8_t level;
@@ -110,6 +112,33 @@ static hap_status_t hap_status_from_esp_err(esp_err_t err)
     default:
         return HAP_STATUS_COMM_ERR;
     }
+}
+
+static uint8_t map_lock_current_to_homekit(gdo_lock_state_t lock)
+{
+    if (lock == GDO_LOCK_STATE_UNLOCKED) {
+        return HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED;
+    }
+    if (lock == GDO_LOCK_STATE_LOCKED) {
+        return HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_SECURED;
+    }
+    return HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNKNOWN;
+}
+
+static bool map_lock_target_to_homekit(gdo_lock_state_t lock, uint8_t *target)
+{
+    if (!target) {
+        return false;
+    }
+    if (lock == GDO_LOCK_STATE_LOCKED) {
+        *target = HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED;
+        return true;
+    }
+    if (lock == GDO_LOCK_STATE_UNLOCKED) {
+        *target = HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED;
+        return true;
+    }
+    return false;
 }
 
 static void set_write_result(hap_write_data_t *write, esp_err_t err, const char *operation)
@@ -177,6 +206,8 @@ void homekit_task_entry(void* ctx) {
     hap_serv_t *motion_svc;
     hap_serv_t *light_svc;
     hap_serv_t *battery_svc;
+    hap_serv_t *lock_svc;
+    hap_serv_t *wall_button_svc;
 
     gdo_notif_event_q = xQueueCreate(16, sizeof(GDOEvent));
     if (!gdo_notif_event_q) {
@@ -232,6 +263,30 @@ void homekit_task_entry(void* ctx) {
 
     hap_acc_add_serv(accessory, light_svc);
 
+    gdo_status_t initial_status = {};
+    uint8_t initial_lock_current = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNKNOWN;
+    uint8_t initial_lock_target = HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED;
+    if (gdo_get_status(&initial_status) == ESP_OK) {
+        initial_lock_current = map_lock_current_to_homekit(initial_status.lock);
+        uint8_t mapped_target = 0;
+        if (map_lock_target_to_homekit(initial_status.lock, &mapped_target)) {
+            initial_lock_target = mapped_target;
+        }
+    }
+
+    lock_svc = hap_serv_lock_mechanism_create(initial_lock_current, initial_lock_target);
+    if (lock_svc) {
+        hap_serv_add_char(lock_svc, hap_char_name_create(const_cast<char*>("GDO Lock")));
+        hap_serv_set_write_cb(lock_svc, gdo_svc_set);
+        hap_acc_add_serv(accessory, lock_svc);
+    }
+
+    wall_button_svc = hap_serv_stateless_programmable_switch_create(HAP_PROGRAMMABLE_SWITCH_SINGLE_PRESS);
+    if (wall_button_svc) {
+        hap_serv_add_char(wall_button_svc, hap_char_name_create(const_cast<char*>("Wall Button")));
+        hap_acc_add_serv(accessory, wall_button_svc);
+    }
+
     homekit_battery_values_t battery_values = map_gdo_battery_to_homekit(GDO_BATT_STATE_UNKNOWN);
     battery_svc = hap_serv_battery_service_create(
         battery_values.level, battery_values.charging_state, battery_values.low_battery);
@@ -267,6 +322,7 @@ void homekit_task_entry(void* ctx) {
     while (true) {
         hap_val_t value;
         hap_char_t* dest = NULL;
+        hap_char_t* extra = NULL;
 
         if (xQueueReceive(gdo_notif_event_q, &e, portMAX_DELAY)) {
             switch (e.dest) {
@@ -280,10 +336,12 @@ void homekit_task_entry(void* ctx) {
                     break;
                 case HomeKitNotifDest::LockCurrentState:
                     dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE);
+                    extra = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE) : NULL;
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::LockTargetState:
                     dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE);
+                    extra = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE) : NULL;
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::Obstruction:
@@ -328,11 +386,23 @@ void homekit_task_entry(void* ctx) {
                     dest = NULL;
                     break;
                 }
+                case HomeKitNotifDest::WallButton:
+                    if (!wall_button_svc) {
+                        break;
+                    }
+                    dest = hap_serv_get_char_by_uuid(wall_button_svc, HAP_CHAR_UUID_PROGRAMMABLE_SWITCH_EVENT);
+                    value.u = e.value.u;
+                    break;
             }
             if (dest) {
                 ESP_LOGI(TAG, "updating characteristic");
                 if (hap_char_update_val(dest, &value) == HAP_FAIL) {
                     ESP_LOGE(TAG, "failed to update characteristic");
+                }
+            }
+            if (extra) {
+                if (hap_char_update_val(extra, &value) == HAP_FAIL) {
+                    ESP_LOGE(TAG, "failed to update secondary characteristic");
                 }
             }
         }
@@ -535,23 +605,16 @@ void notify_homekit_obstruction(gdo_obstruction_state_t obstructed) {
 void notify_homekit_current_lock(gdo_lock_state_t lock) {
     GDOEvent e;
     e.dest = HomeKitNotifDest::LockCurrentState;
-    if (lock == GDO_LOCK_STATE_UNLOCKED) {
-        e.value.u = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNSECURED;
-    } else if (lock == GDO_LOCK_STATE_LOCKED) {
-        e.value.u = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_SECURED;
-    } else {
-        e.value.u = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNKNOWN;
-    }
+    e.value.u = map_lock_current_to_homekit(lock);
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of lock state");
     }
 }
 
 void notify_homekit_target_lock(gdo_lock_state_t lock) {
-    if (lock == GDO_LOCK_STATE_LOCKED) {
-        queue_homekit_uint(HomeKitNotifDest::LockTargetState, HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_SECURED, "lock target state");
-    } else if (lock == GDO_LOCK_STATE_UNLOCKED) {
-        queue_homekit_uint(HomeKitNotifDest::LockTargetState, HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED, "lock target state");
+    uint8_t target = 0;
+    if (map_lock_target_to_homekit(lock, &target)) {
+        queue_homekit_uint(HomeKitNotifDest::LockTargetState, target, "lock target state");
     }
 }
 
@@ -586,6 +649,13 @@ void notify_homekit_battery(gdo_battery_state_t battery) {
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of battery");
     }
+}
+
+void notify_homekit_wall_button(gdo_button_state_t button) {
+    if (button != GDO_BUTTON_STATE_PRESSED) {
+        return;
+    }
+    queue_homekit_uint(HomeKitNotifDest::WallButton, HAP_PROGRAMMABLE_SWITCH_SINGLE_PRESS, "wall button");
 }
 
 int homekit_paired_controller_count(void)

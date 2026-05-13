@@ -152,6 +152,12 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
 
         if (status->synced) {
             s_rolling_code_recovery_attempts = 0;
+            if (status->protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+                esp_err_t save_err = app_settings_save_secplus_identity(status->client_id, status->rolling_code);
+                if (save_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Unable to persist Security+ identity: %s", esp_err_to_name(save_err));
+                }
+            }
         } else if (s_rolling_code_recovery_attempts < MAX_ROLLING_CODE_RECOVERY_ATTEMPTS) {
             const uint32_t old_rolling_code = status->rolling_code;
             if (old_rolling_code > MAX_SECPLUS_V2_ROLLING_CODE - ROLLING_CODE_RECOVERY_STEP) {
@@ -215,6 +221,7 @@ static void gdo_event_handler(const gdo_status_t* status, gdo_cb_event_t event, 
         break;
     case GDO_CB_EVENT_BUTTON:
         ESP_LOGI(TAG, "Button: %s", gdo_button_state_to_string(status->button));
+        notify_homekit_wall_button(status->button);
         break;
     case GDO_CB_EVENT_MOTOR:
         ESP_LOGI(TAG, "Motor: %s", gdo_motor_state_to_string(status->motor));

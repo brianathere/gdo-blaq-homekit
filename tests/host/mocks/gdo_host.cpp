@@ -25,6 +25,8 @@ void set_defaults(void)
     g_status.synced = true;
     g_status.open_ms = 12000;
     g_status.close_ms = 13000;
+    g_status.client_id = 0x2908;
+    g_status.rolling_code = 0;
     g_min_command_interval_ms = 0;
     g_last_rx_ms = 1000;
     g_next_apply_result = ESP_OK;
@@ -108,6 +110,27 @@ extern "C" esp_err_t gdo_set_min_command_interval(uint32_t ms)
         return g_next_apply_result;
     }
     g_min_command_interval_ms = ms;
+    return ESP_OK;
+}
+
+extern "C" esp_err_t gdo_set_client_id(uint32_t client_id)
+{
+    if (g_next_apply_result != ESP_OK) {
+        return g_next_apply_result;
+    }
+    g_status.client_id = client_id;
+    return ESP_OK;
+}
+
+extern "C" esp_err_t gdo_set_rolling_code(uint32_t rolling_code)
+{
+    if (g_next_apply_result != ESP_OK) {
+        return g_next_apply_result;
+    }
+    if (rolling_code > 0x0fffffffU) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    g_status.rolling_code = rolling_code;
     return ESP_OK;
 }
 
