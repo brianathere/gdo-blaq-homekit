@@ -65,6 +65,7 @@ struct GDOEvent {
 static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_priv, void *write_priv);
 static void sync_homekit_from_gdo_status(void);
+static GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state);
 
 static constexpr uint8_t HAP_CHARGING_NOT_CHARGING = 0;
 static constexpr uint8_t HAP_CHARGING_CHARGING = 1;
@@ -73,6 +74,31 @@ static constexpr uint8_t HAP_LOW_BATTERY_NORMAL = 0;
 static constexpr uint8_t HAP_STATUS_FAULT_NONE = 0;
 static constexpr uint8_t HAP_STATUS_FAULT_GENERAL = 1;
 static constexpr uint8_t HAP_PROGRAMMABLE_SWITCH_SINGLE_PRESS = 0;
+
+static constexpr int32_t IID_GDO_SERVICE = 20;
+static constexpr int32_t IID_GDO_CURRENT_DOOR_STATE = 21;
+static constexpr int32_t IID_GDO_TARGET_DOOR_STATE = 22;
+static constexpr int32_t IID_GDO_OBSTRUCTION = 23;
+static constexpr int32_t IID_GDO_NAME = 24;
+static constexpr int32_t IID_MOTION_SERVICE = 30;
+static constexpr int32_t IID_MOTION_DETECTED = 31;
+static constexpr int32_t IID_MOTION_NAME = 32;
+static constexpr int32_t IID_LIGHT_SERVICE = 40;
+static constexpr int32_t IID_LIGHT_ON = 41;
+static constexpr int32_t IID_LIGHT_NAME = 42;
+static constexpr int32_t IID_LOCK_SERVICE = 50;
+static constexpr int32_t IID_LOCK_CURRENT_STATE = 51;
+static constexpr int32_t IID_LOCK_TARGET_STATE = 52;
+static constexpr int32_t IID_LOCK_NAME = 53;
+static constexpr int32_t IID_WALL_BUTTON_SERVICE = 60;
+static constexpr int32_t IID_WALL_BUTTON_EVENT = 61;
+static constexpr int32_t IID_WALL_BUTTON_NAME = 62;
+static constexpr int32_t IID_BATTERY_SERVICE = 70;
+static constexpr int32_t IID_BATTERY_LEVEL = 71;
+static constexpr int32_t IID_BATTERY_CHARGING_STATE = 72;
+static constexpr int32_t IID_BATTERY_LOW_STATUS = 73;
+static constexpr int32_t IID_BATTERY_NAME = 74;
+static constexpr int32_t IID_BATTERY_FAULT = 75;
 
 typedef struct {
     uint8_t level;
@@ -91,6 +117,38 @@ static homekit_battery_values_t map_gdo_battery_to_homekit(gdo_battery_state_t b
     case GDO_BATT_STATE_UNKNOWN:
     default:
         return {0, HAP_CHARGING_NOT_CHARGEABLE, HAP_LOW_BATTERY_NORMAL, HAP_STATUS_FAULT_GENERAL};
+    }
+}
+
+static uint8_t map_gdo_obstruction_to_homekit(gdo_obstruction_state_t obstructed)
+{
+    return obstructed == GDO_OBSTRUCTION_STATE_OBSTRUCTED
+        ? HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED
+        : HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR;
+}
+
+static bool map_gdo_target_to_homekit(gdo_door_state_t door, int32_t door_target, uint8_t *target)
+{
+    if (!target) {
+        return false;
+    }
+    switch (door) {
+    case GDO_DOOR_STATE_OPEN:
+    case GDO_DOOR_STATE_OPENING:
+        *target = HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN;
+        return true;
+    case GDO_DOOR_STATE_CLOSED:
+    case GDO_DOOR_STATE_CLOSING:
+        *target = HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_CLOSED;
+        return true;
+    default:
+        if (door_target >= 0) {
+            *target = door_target <= 5000
+                ? HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN
+                : HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_CLOSED;
+            return true;
+        }
+        return false;
     }
 }
 
@@ -148,6 +206,62 @@ static void set_write_result(hap_write_data_t *write, esp_err_t err, const char 
         hap_char_update_val(write->hc, &(write->val));
     } else {
         ESP_LOGE(TAG, "%s failed: %s", operation, esp_err_to_name(err));
+    }
+}
+
+static void set_char_iid(hap_serv_t *service, const char *uuid, int32_t iid, const char *name)
+{
+    if (!service) {
+        return;
+    }
+    hap_char_t *characteristic = hap_serv_get_char_by_uuid(service, uuid);
+    if (!characteristic) {
+        ESP_LOGW(TAG, "missing HomeKit characteristic for IID pin: %s", name);
+        return;
+    }
+    hap_char_set_iid(characteristic, iid);
+}
+
+static void pin_homekit_iids(hap_serv_t *gdo_svc, hap_serv_t *motion_svc, hap_serv_t *light_svc,
+                             hap_serv_t *lock_svc, hap_serv_t *wall_button_svc, hap_serv_t *battery_svc)
+{
+    hap_serv_set_iid(gdo_svc, IID_GDO_SERVICE);
+    set_char_iid(gdo_svc, HAP_CHAR_UUID_CURRENT_DOOR_STATE, IID_GDO_CURRENT_DOOR_STATE, "garage current door state");
+    set_char_iid(gdo_svc, HAP_CHAR_UUID_TARGET_DOOR_STATE, IID_GDO_TARGET_DOOR_STATE, "garage target door state");
+    set_char_iid(gdo_svc, HAP_CHAR_UUID_OBSTRUCTION_DETECTED, IID_GDO_OBSTRUCTION, "garage obstruction");
+    set_char_iid(gdo_svc, HAP_CHAR_UUID_NAME, IID_GDO_NAME, "garage name");
+
+    hap_serv_set_iid(motion_svc, IID_MOTION_SERVICE);
+    set_char_iid(motion_svc, HAP_CHAR_UUID_MOTION_DETECTED, IID_MOTION_DETECTED, "motion detected");
+    set_char_iid(motion_svc, HAP_CHAR_UUID_NAME, IID_MOTION_NAME, "motion name");
+
+    hap_serv_set_iid(light_svc, IID_LIGHT_SERVICE);
+    set_char_iid(light_svc, HAP_CHAR_UUID_ON, IID_LIGHT_ON, "light on");
+    set_char_iid(light_svc, HAP_CHAR_UUID_NAME, IID_LIGHT_NAME, "light name");
+
+    if (lock_svc) {
+        hap_serv_set_iid(lock_svc, IID_LOCK_SERVICE);
+        set_char_iid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE, IID_LOCK_CURRENT_STATE, "lock current state");
+        set_char_iid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE, IID_LOCK_TARGET_STATE, "lock target state");
+        set_char_iid(lock_svc, HAP_CHAR_UUID_NAME, IID_LOCK_NAME, "lock name");
+    }
+
+    if (wall_button_svc) {
+        hap_serv_set_iid(wall_button_svc, IID_WALL_BUTTON_SERVICE);
+        set_char_iid(wall_button_svc, HAP_CHAR_UUID_PROGRAMMABLE_SWITCH_EVENT, IID_WALL_BUTTON_EVENT,
+                     "wall button event");
+        set_char_iid(wall_button_svc, HAP_CHAR_UUID_NAME, IID_WALL_BUTTON_NAME, "wall button name");
+    }
+
+    if (battery_svc) {
+        hap_serv_set_iid(battery_svc, IID_BATTERY_SERVICE);
+        set_char_iid(battery_svc, HAP_CHAR_UUID_BATTERY_LEVEL, IID_BATTERY_LEVEL, "battery level");
+        set_char_iid(battery_svc, HAP_CHAR_UUID_CHARGING_STATE, IID_BATTERY_CHARGING_STATE,
+                     "battery charging state");
+        set_char_iid(battery_svc, HAP_CHAR_UUID_STATUS_LOW_BATTERY, IID_BATTERY_LOW_STATUS,
+                     "battery low status");
+        set_char_iid(battery_svc, HAP_CHAR_UUID_NAME, IID_BATTERY_NAME, "battery name");
+        set_char_iid(battery_svc, HAP_CHAR_UUID_STATUS_FAULT, IID_BATTERY_FAULT, "battery fault");
     }
 }
 
@@ -223,6 +337,32 @@ void homekit_task_entry(void* ctx) {
     }
     hap_register_event_handler(homekit_event_handler);
 
+    gdo_status_t initial_status = {};
+    bool have_initial_status = gdo_get_status(&initial_status) == ESP_OK;
+    uint8_t initial_door_current = HOMEKIT_CHARACTERISTIC_CURRENT_DOOR_STATE_STOPPED;
+    uint8_t initial_door_target = HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_CLOSED;
+    uint8_t initial_obstruction = HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR;
+    bool initial_motion = false;
+    bool initial_light = false;
+    uint8_t initial_lock_current = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNKNOWN;
+    uint8_t initial_lock_target = HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED;
+    homekit_battery_values_t battery_values = map_gdo_battery_to_homekit(GDO_BATT_STATE_UNKNOWN);
+    if (have_initial_status) {
+        initial_door_current = map_gdo_to_homekit_state(initial_status.door);
+        uint8_t mapped_target = 0;
+        if (map_gdo_target_to_homekit(initial_status.door, initial_status.door_target, &mapped_target)) {
+            initial_door_target = mapped_target;
+        }
+        initial_obstruction = map_gdo_obstruction_to_homekit(initial_status.obstruction);
+        initial_motion = initial_status.motion == GDO_MOTION_STATE_DETECTED;
+        initial_light = initial_status.light == GDO_LIGHT_STATE_ON;
+        initial_lock_current = map_lock_current_to_homekit(initial_status.lock);
+        if (map_lock_target_to_homekit(initial_status.lock, &mapped_target)) {
+            initial_lock_target = mapped_target;
+        }
+        battery_values = map_gdo_battery_to_homekit(initial_status.battery);
+    }
+
     hap_acc_cfg_t config;
     const esp_app_desc_t *app_desc = esp_app_get_description();
     static char hw_rev[32];
@@ -238,41 +378,31 @@ void homekit_task_entry(void* ctx) {
 
     accessory = hap_acc_create(&config);
 
-    // create garage door opener service with optional lock characteristics
+    // create garage door opener service
     gdo_svc = hap_serv_garage_door_opener_create(
-            HOMEKIT_CHARACTERISTIC_CURRENT_DOOR_STATE_OPEN,
-            HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN,
-            HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED);
+            initial_door_current,
+            initial_door_target,
+            initial_obstruction);
+    hap_serv_mark_primary(gdo_svc);
     hap_serv_add_char(gdo_svc, hap_char_name_create(const_cast<char*>("Konnected blaQ")));
-    hap_serv_add_char(gdo_svc, hap_char_lock_current_state_create(0));
-    hap_serv_add_char(gdo_svc, hap_char_lock_target_state_create(0));
 
     hap_serv_set_write_cb(gdo_svc, gdo_svc_set);
 
     hap_acc_add_serv(accessory, gdo_svc);
 
     // create the motion sensor service with no optional characteristics (e.g. active)
-    motion_svc = hap_serv_motion_sensor_create(false);
+    motion_svc = hap_serv_motion_sensor_create(initial_motion);
+    hap_serv_add_char(motion_svc, hap_char_name_create(const_cast<char*>("GDO Motion")));
 
     hap_acc_add_serv(accessory, motion_svc);
 
     // create the light service with no optional characteristics (e.g. brightness)
-    light_svc = hap_serv_lightbulb_create(false);
+    light_svc = hap_serv_lightbulb_create(initial_light);
+    hap_serv_add_char(light_svc, hap_char_name_create(const_cast<char*>("GDO Light")));
 
     hap_serv_set_write_cb(light_svc, light_svc_set);
 
     hap_acc_add_serv(accessory, light_svc);
-
-    gdo_status_t initial_status = {};
-    uint8_t initial_lock_current = HOMEKIT_CHARACTERISTIC_CURRENT_LOCK_STATE_UNKNOWN;
-    uint8_t initial_lock_target = HOMEKIT_CHARACTERISTIC_TARGET_LOCK_STATE_UNSECURED;
-    if (gdo_get_status(&initial_status) == ESP_OK) {
-        initial_lock_current = map_lock_current_to_homekit(initial_status.lock);
-        uint8_t mapped_target = 0;
-        if (map_lock_target_to_homekit(initial_status.lock, &mapped_target)) {
-            initial_lock_target = mapped_target;
-        }
-    }
 
     lock_svc = hap_serv_lock_mechanism_create(initial_lock_current, initial_lock_target);
     if (lock_svc) {
@@ -287,7 +417,6 @@ void homekit_task_entry(void* ctx) {
         hap_acc_add_serv(accessory, wall_button_svc);
     }
 
-    homekit_battery_values_t battery_values = map_gdo_battery_to_homekit(GDO_BATT_STATE_UNKNOWN);
     battery_svc = hap_serv_battery_service_create(
         battery_values.level, battery_values.charging_state, battery_values.low_battery);
     if (battery_svc) {
@@ -295,6 +424,24 @@ void homekit_task_entry(void* ctx) {
         hap_serv_add_char(battery_svc, hap_char_status_fault_create(battery_values.fault));
         hap_acc_add_serv(accessory, battery_svc);
     }
+
+    if (hap_serv_link_serv(gdo_svc, motion_svc) != HAP_SUCCESS) {
+        ESP_LOGW(TAG, "failed to link motion service to garage door service");
+    }
+    if (hap_serv_link_serv(gdo_svc, light_svc) != HAP_SUCCESS) {
+        ESP_LOGW(TAG, "failed to link light service to garage door service");
+    }
+    if (lock_svc && hap_serv_link_serv(gdo_svc, lock_svc) != HAP_SUCCESS) {
+        ESP_LOGW(TAG, "failed to link lock service to garage door service");
+    }
+    if (wall_button_svc && hap_serv_link_serv(gdo_svc, wall_button_svc) != HAP_SUCCESS) {
+        ESP_LOGW(TAG, "failed to link wall button service to garage door service");
+    }
+    if (battery_svc && hap_serv_link_serv(gdo_svc, battery_svc) != HAP_SUCCESS) {
+        ESP_LOGW(TAG, "failed to link battery service to garage door service");
+    }
+
+    pin_homekit_iids(gdo_svc, motion_svc, light_svc, lock_svc, wall_button_svc, battery_svc);
 
     hap_add_accessory(accessory);
 
@@ -322,7 +469,6 @@ void homekit_task_entry(void* ctx) {
     while (true) {
         hap_val_t value;
         hap_char_t* dest = NULL;
-        hap_char_t* extra = NULL;
 
         if (xQueueReceive(gdo_notif_event_q, &e, portMAX_DELAY)) {
             switch (e.dest) {
@@ -335,13 +481,11 @@ void homekit_task_entry(void* ctx) {
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::LockCurrentState:
-                    dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE);
-                    extra = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE) : NULL;
+                    dest = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_CURRENT_STATE) : NULL;
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::LockTargetState:
-                    dest = hap_serv_get_char_by_uuid(gdo_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE);
-                    extra = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE) : NULL;
+                    dest = lock_svc ? hap_serv_get_char_by_uuid(lock_svc, HAP_CHAR_UUID_LOCK_TARGET_STATE) : NULL;
                     value.u = e.value.u;
                     break;
                 case HomeKitNotifDest::Obstruction:
@@ -398,11 +542,6 @@ void homekit_task_entry(void* ctx) {
                 ESP_LOGI(TAG, "updating characteristic");
                 if (hap_char_update_val(dest, &value) == HAP_FAIL) {
                     ESP_LOGE(TAG, "failed to update characteristic");
-                }
-            }
-            if (extra) {
-                if (hap_char_update_val(extra, &value) == HAP_FAIL) {
-                    ESP_LOGE(TAG, "failed to update secondary characteristic");
                 }
             }
         }
@@ -479,7 +618,7 @@ static int gdo_svc_set(hap_write_data_t write_data[], int count, void *serv_priv
     return ret;
 }
 
-GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
+static GarageDoorCurrentState map_gdo_to_homekit_state(gdo_door_state_t gdo_state) {
     switch (gdo_state) {
         case GDO_DOOR_STATE_OPEN:
             return CURR_OPEN;
@@ -536,17 +675,9 @@ void notify_homekit_current_door_state_change(gdo_door_state_t door) {
 }
 
 void notify_homekit_target_door_state_change(gdo_door_state_t door) {
-    switch (door) {
-    case GDO_DOOR_STATE_OPEN:
-    case GDO_DOOR_STATE_OPENING:
-        queue_homekit_uint(HomeKitNotifDest::DoorTargetState, HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_OPEN, "door target state");
-        break;
-    case GDO_DOOR_STATE_CLOSED:
-    case GDO_DOOR_STATE_CLOSING:
-        queue_homekit_uint(HomeKitNotifDest::DoorTargetState, HOMEKIT_CHARACTERISTIC_TARGET_DOOR_STATE_CLOSED, "door target state");
-        break;
-    default:
-        break;
+    uint8_t target = 0;
+    if (map_gdo_target_to_homekit(door, -1, &target)) {
+        queue_homekit_uint(HomeKitNotifDest::DoorTargetState, target, "door target state");
     }
 }
 
@@ -592,9 +723,7 @@ static int light_svc_set(hap_write_data_t write_data[], int count, void *serv_pr
 void notify_homekit_obstruction(gdo_obstruction_state_t obstructed) {
     GDOEvent e;
     e.dest = HomeKitNotifDest::Obstruction;
-    e.value.b = (obstructed == GDO_OBSTRUCTION_STATE_CLEAR)
-                  ? HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_CLEAR
-                  : HOMEKIT_CHARACTERISTIC_OBSTRUCTION_SENSOR_OBSTRUCTED;
+    e.value.b = map_gdo_obstruction_to_homekit(obstructed);
     if (!gdo_notif_event_q || xQueueSend(gdo_notif_event_q, &e, 0) == errQUEUE_FULL) {
         ESP_LOGE(TAG, "could not queue homekit notif of door obstructed");
     }

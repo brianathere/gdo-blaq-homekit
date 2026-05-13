@@ -509,7 +509,8 @@ static std::string build_status_json(void) {
         json_prop_format(out, gdo_first, "close_ms", "%u", status.close_ms);
         json_prop_format(out, gdo_first, "last_rx_ms", "%" PRIu32, last_rx_ms);
         if (last_rx_ms) {
-            json_prop_format(out, gdo_first, "last_rx_age_ms", "%" PRIu32, (uint32_t)(now - last_rx_ms));
+            uint32_t last_rx_age_ms = last_rx_ms <= now ? (uint32_t)(now - last_rx_ms) : 0;
+            json_prop_format(out, gdo_first, "last_rx_age_ms", "%" PRIu32, last_rx_age_ms);
         } else {
             json_prop_null(out, gdo_first, "last_rx_age_ms");
         }
