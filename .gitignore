@@ -7,4 +7,7 @@ sdkconfig.old
 sdkconfig
 .vscode
 .clangd
-
+crash-*
+leak-*
+oom-*
+timeout-*

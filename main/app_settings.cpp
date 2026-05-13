@@ -191,9 +191,8 @@ esp_err_t app_settings_apply_gdo_pre_start(const app_settings_t *settings)
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = ESP_OK;
     if (settings->protocol_override != APP_PROTOCOL_AUTO) {
-        err = gdo_set_protocol(app_protocol_override_to_gdo(settings->protocol_override));
+        esp_err_t err = gdo_set_protocol(app_protocol_override_to_gdo(settings->protocol_override));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Unable to apply protocol override: %s", esp_err_to_name(err));
             return err;

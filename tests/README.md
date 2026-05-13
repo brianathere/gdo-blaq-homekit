@@ -72,6 +72,41 @@ python tests/hardware_smoke.py \
 
 These checks exercise the pure `gdolib/secplus.c` protocol helpers without ESP-IDF hardware dependencies.
 
+## Host App Harness
+
+The `tests/host` harness builds selected app and dependency code as a native macOS/Linux binary with minimal ESP-IDF mocks. It covers the event ring buffer, settings persistence/apply flow, HomeKit TLV helpers, and `gdolib/secplus.c` under ASan/UBSan.
+
+Install Ninja on macOS:
+
+```sh
+brew install ninja
+```
+
+Run the deterministic host tests:
+
+```sh
+tests/host/run.sh test
+```
+
+Run short libFuzzer smoke tests:
+
+```sh
+tests/host/run.sh fuzz
+```
+
+Run Cppcheck using the generated compile database:
+
+```sh
+tests/host/run.sh analyze
+```
+
+Build and run in Docker when local Clang/CMake versions are a problem:
+
+```sh
+docker build -f tests/host/Dockerfile -t gdo-blaq-host-tests .
+docker run --rm gdo-blaq-host-tests
+```
+
 CBMC bounded smoke check:
 
 ```sh
