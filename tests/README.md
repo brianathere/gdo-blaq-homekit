@@ -54,6 +54,18 @@ python tests/hardware_smoke.py \
   --probe-url http://<device-ip>:8080/
 ```
 
+## Port 8080 OTA Update
+
+The first OTA-capable build must be flashed over USB because it changes the partition table from a single app slot to `ota_0`/`ota_1`. After that, app-only firmware updates can be installed over port 8080:
+
+```sh
+GDO_ADMIN_PIN=<web-admin-password> python tests/ota_update.py \
+  --base-url http://<device-ip>:8080 \
+  --bin build/gdo-blaq-homekit.bin
+```
+
+You can also open `http://<device-ip>:8080/ota` in a browser. The OTA endpoint requires the 8080 admin password to be configured first.
+
 ## What It Verifies
 
 - Flash command exits successfully when `--flash` is used.
@@ -67,6 +79,7 @@ python tests/hardware_smoke.py \
 - Optional HTTP probe confirms the dashboard responds and, when reachable, validates `/api/status` JSON contains `app`, `gdo`, `wifi`, and `heap` sections.
 - Optional HTTP probe also validates `/api/events`, `/api/settings`, `/api/homekit/setup`, and confirms protected mutation APIs reject missing admin credentials.
 - When `--admin-pin` or `GDO_ADMIN_PIN` is provided, the probe sets or checks the admin PIN and verifies an admin-protected event clear request succeeds.
+- `tests/ota_update.py` verifies the running OTA slot, uploads the firmware image to `/api/ota`, and waits for the device to reboot into the alternate slot.
 
 ## Host Protocol Checks
 

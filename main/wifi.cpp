@@ -13,9 +13,13 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <gdo.h>
 #include <json_parser.h>
 #include <nvs_wifi_connect.h>
@@ -31,6 +35,23 @@ extern "C" {
 
 static const char* TAG = "wifi";
 static constexpr size_t ADMIN_PIN_BUFFER_SIZE = 72;
+static constexpr size_t OTA_UPLOAD_BUFFER_SIZE = 4096;
+static constexpr uint32_t OTA_REBOOT_DELAY_MS = 1200;
+
+typedef struct {
+    bool in_progress;
+    bool has_last_result;
+    bool last_success;
+    uint32_t started_ms;
+    uint32_t finished_ms;
+    uint32_t expected_bytes;
+    uint32_t written_bytes;
+    esp_err_t last_error;
+    char partition[17];
+    char version[33];
+} ota_runtime_state_t;
+
+static ota_runtime_state_t s_ota_state = {};
 
 static uint32_t millis(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -176,6 +197,134 @@ static void add_ip_info(std::string &out, bool &first, const char *name, const c
     out += '}';
 }
 
+static const char *partition_subtype_to_string(esp_partition_type_t type, uint8_t subtype) {
+    if (type == ESP_PARTITION_TYPE_APP) {
+        switch (subtype) {
+        case ESP_PARTITION_SUBTYPE_APP_FACTORY:
+            return "factory";
+        case ESP_PARTITION_SUBTYPE_APP_OTA_0:
+            return "ota_0";
+        case ESP_PARTITION_SUBTYPE_APP_OTA_1:
+            return "ota_1";
+        case ESP_PARTITION_SUBTYPE_APP_TEST:
+            return "test";
+        default:
+            return "unknown";
+        }
+    }
+    if (type == ESP_PARTITION_TYPE_DATA) {
+        switch (subtype) {
+        case ESP_PARTITION_SUBTYPE_DATA_OTA:
+            return "otadata";
+        case ESP_PARTITION_SUBTYPE_DATA_NVS:
+            return "nvs";
+        case ESP_PARTITION_SUBTYPE_DATA_PHY:
+            return "phy";
+        default:
+            return "unknown";
+        }
+    }
+    return "unknown";
+}
+
+static void json_partition_info(std::string &out, bool &first, const char *name, const esp_partition_t *partition) {
+    if (!partition) {
+        json_prop_null(out, first, name);
+        return;
+    }
+
+    bool part_first = true;
+    json_object_start(out, first, name, part_first);
+    json_prop_string(out, part_first, "label", partition->label);
+    json_prop_string(out, part_first, "type", partition->type == ESP_PARTITION_TYPE_APP ? "app" : "data");
+    json_prop_string(out, part_first, "subtype", partition_subtype_to_string(partition->type, partition->subtype));
+    json_prop_format(out, part_first, "address", "%" PRIu32, (uint32_t)partition->address);
+    json_prop_format(out, part_first, "size", "%" PRIu32, (uint32_t)partition->size);
+    out += '}';
+}
+
+static void ota_state_started(const esp_partition_t *partition, size_t expected_bytes) {
+    s_ota_state.in_progress = true;
+    s_ota_state.started_ms = millis();
+    s_ota_state.finished_ms = 0;
+    s_ota_state.expected_bytes = (uint32_t)expected_bytes;
+    s_ota_state.written_bytes = 0;
+    s_ota_state.last_error = ESP_OK;
+    s_ota_state.last_success = false;
+    s_ota_state.has_last_result = false;
+    snprintf(s_ota_state.partition, sizeof(s_ota_state.partition), "%s", partition ? partition->label : "");
+    s_ota_state.version[0] = 0;
+}
+
+static void ota_state_progress(size_t written_bytes) {
+    s_ota_state.written_bytes = (uint32_t)written_bytes;
+}
+
+static void ota_state_finished(bool success, esp_err_t err, const char *version) {
+    s_ota_state.in_progress = false;
+    s_ota_state.has_last_result = true;
+    s_ota_state.last_success = success;
+    s_ota_state.last_error = err;
+    s_ota_state.finished_ms = millis();
+    if (version && version[0]) {
+        snprintf(s_ota_state.version, sizeof(s_ota_state.version), "%s", version);
+    }
+}
+
+static void append_ota_status_object(std::string &out, bool &root_first, const char *name) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *configured = esp_ota_get_boot_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+
+    bool ota_first = true;
+    json_object_start(out, root_first, name, ota_first);
+    json_prop_bool(out, ota_first, "supported", next != nullptr);
+    json_prop_bool(out, ota_first, "admin_pin_required", true);
+    json_prop_bool(out, ota_first, "admin_pin_configured", app_admin_pin_configured());
+    if (next) {
+        json_prop_format(out, ota_first, "max_image_bytes", "%" PRIu32, (uint32_t)next->size);
+    } else {
+        json_prop_null(out, ota_first, "max_image_bytes");
+    }
+    json_partition_info(out, ota_first, "running_partition", running);
+    json_partition_info(out, ota_first, "configured_boot_partition", configured);
+    json_partition_info(out, ota_first, "next_update_partition", next);
+
+    ota_runtime_state_t state = s_ota_state;
+    bool runtime_first = true;
+    json_object_start(out, ota_first, "runtime", runtime_first);
+    json_prop_bool(out, runtime_first, "in_progress", state.in_progress);
+    json_prop_format(out, runtime_first, "started_ms", "%" PRIu32, state.started_ms);
+    json_prop_format(out, runtime_first, "finished_ms", "%" PRIu32, state.finished_ms);
+    json_prop_format(out, runtime_first, "expected_bytes", "%" PRIu32, state.expected_bytes);
+    json_prop_format(out, runtime_first, "written_bytes", "%" PRIu32, state.written_bytes);
+    json_prop_string(out, runtime_first, "partition", state.partition);
+    if (state.has_last_result) {
+        json_prop_bool(out, runtime_first, "last_success", state.last_success);
+        json_prop_string(out, runtime_first, "last_error", esp_err_to_name(state.last_error));
+    } else {
+        json_prop_null(out, runtime_first, "last_success");
+        json_prop_null(out, runtime_first, "last_error");
+    }
+    if (state.version[0]) {
+        json_prop_string(out, runtime_first, "last_version", state.version);
+    } else {
+        json_prop_null(out, runtime_first, "last_version");
+    }
+    out += '}';
+    out += '}';
+}
+
+static std::string build_ota_status_json(void) {
+    std::string out;
+    out.reserve(1536);
+    bool root_first = true;
+    out += '{';
+    append_ota_status_object(out, root_first, "ota");
+    out += '}';
+    return out;
+}
+
 static std::string build_status_json(void) {
     const uint32_t now = millis();
     const esp_app_desc_t *app_desc = esp_app_get_description();
@@ -205,6 +354,8 @@ static std::string build_status_json(void) {
         json_prop_null(out, app_first, "last_gdo_event_age_ms");
     }
     out += '}';
+
+    append_ota_status_object(out, root_first, "ota");
 
     app_events_summary_t events_summary = {};
     app_events_get_summary(&events_summary);
@@ -619,6 +770,189 @@ static esp_err_t events_get_handler(httpd_req_t *req) {
     return send_json_response(req, app_events_build_json(limit, category, severity));
 }
 
+static const char OTA_PAGE[] =
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>GDO Firmware Update</title>"
+    "<style>"
+    ":root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#f6f7f9;color:#17202a}"
+    "body{margin:0;padding:24px;display:flex;justify-content:center}"
+    "main{width:min(760px,100%);display:grid;gap:16px}"
+    "section{background:#fff;border:1px solid #d8dde6;border-radius:8px;padding:18px}"
+    "h1{font-size:24px;margin:0 0 4px}h2{font-size:16px;margin:0 0 12px}"
+    "label{display:grid;gap:6px;font-size:13px;color:#405066;margin:12px 0}"
+    "input,button{font:inherit;border-radius:6px;border:1px solid #b8c0cc;padding:10px;background:#fff;color:inherit}"
+    "button{background:#1264a3;color:#fff;border-color:#1264a3;cursor:pointer;min-height:42px}"
+    "button:disabled{opacity:.55;cursor:not-allowed}"
+    ".row{display:grid;grid-template-columns:1fr 1fr;gap:12px}"
+    ".kv{display:grid;grid-template-columns:160px 1fr;gap:8px;font-size:14px}.kv div{overflow-wrap:anywhere}"
+    "pre{white-space:pre-wrap;word-break:break-word;background:#111827;color:#f9fafb;border-radius:8px;padding:12px;min-height:70px}"
+    ".muted{color:#667085;font-size:13px}.ok{color:#067647}.bad{color:#b42318}"
+    "@media (prefers-color-scheme:dark){:root{background:#111827;color:#f9fafb}section{background:#182230;border-color:#344054}input{background:#111827}.muted{color:#98a2b3}}"
+    "@media (max-width:640px){body{padding:14px}.row{grid-template-columns:1fr}.kv{grid-template-columns:1fr}}"
+    "</style></head><body><main>"
+    "<header><h1>Firmware Update</h1><div class=\"muted\">GDO blaQ HomeKit on port 8080</div></header>"
+    "<section><h2>Status</h2><div class=\"kv\">"
+    "<b>Supported</b><div id=\"supported\">-</div>"
+    "<b>Admin password</b><div id=\"admin\">-</div>"
+    "<b>Running slot</b><div id=\"running\">-</div>"
+    "<b>Next slot</b><div id=\"next\">-</div>"
+    "<b>Max image</b><div id=\"max\">-</div>"
+    "</div></section>"
+    "<section><h2>Install</h2>"
+    "<div class=\"row\"><label>Admin password<input id=\"pin\" type=\"password\" autocomplete=\"current-password\"></label>"
+    "<label>Firmware binary<input id=\"file\" type=\"file\" accept=\".bin,application/octet-stream\"></label></div>"
+    "<button id=\"upload\" type=\"button\">Install and Reboot</button>"
+    "<p id=\"message\" class=\"muted\"></p></section>"
+    "<section><h2>Response</h2><pre id=\"response\"></pre></section>"
+    "</main><script>"
+    "const $=id=>document.getElementById(id);"
+    "function headers(){const p=$('pin').value;return p?{'X-Admin-PIN':p}:{};}"
+    "function part(p){return p?p.label+' @ 0x'+Number(p.address).toString(16)+' ('+Math.round(p.size/1024)+' KB)':'-';}"
+    "function msg(t,c){$('message').className=c||'muted';$('message').textContent=t;}"
+    "async function refresh(){try{const r=await fetch('/api/ota',{headers:headers(),cache:'no-store'});const t=await r.text();$('response').textContent=t;const j=JSON.parse(t).ota;"
+    "$('supported').textContent=j.supported?'yes':'no';$('supported').className=j.supported?'ok':'bad';"
+    "$('admin').textContent=j.admin_pin_configured?'configured':'required before OTA';$('admin').className=j.admin_pin_configured?'ok':'bad';"
+    "$('running').textContent=part(j.running_partition);$('next').textContent=part(j.next_update_partition);"
+    "$('max').textContent=j.max_image_bytes?Math.round(j.max_image_bytes/1024)+' KB':'-';"
+    "$('upload').disabled=!j.supported||!j.admin_pin_configured||j.runtime.in_progress;}catch(e){msg('Status unavailable: '+e,'bad');}}"
+    "$('upload').onclick=async()=>{const f=$('file').files[0];if(!f){msg('Select a firmware .bin first.','bad');return;}if(!$('pin').value){msg('Enter the admin password.','bad');return;}"
+    "msg('Uploading '+f.name+' ('+f.size+' bytes)...');$('upload').disabled=true;"
+    "try{const h=Object.assign({'Content-Type':'application/octet-stream'},headers());const r=await fetch('/api/ota',{method:'POST',headers:h,body:f});const t=await r.text();$('response').textContent=t;"
+    "if(!r.ok){msg('Update failed: '+t,'bad');$('upload').disabled=false;return;}msg('Update installed. Device is rebooting.','ok');setTimeout(refresh,8000);}"
+    "catch(e){msg('Upload failed: '+e,'bad');$('upload').disabled=false;}};"
+    "$('pin').onchange=refresh;refresh();"
+    "</script></body></html>";
+
+static esp_err_t ota_page_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, OTA_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_get_handler(httpd_req_t *req) {
+    if (!web_access_allowed(req)) {
+        return ESP_OK;
+    }
+    return send_json_response(req, build_ota_status_json());
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req) {
+    if (!require_admin(req)) {
+        return ESP_OK;
+    }
+    if (s_ota_state.in_progress) {
+        return send_error_response(req, "409 Conflict", "ota_in_progress");
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(nullptr);
+    if (!update_partition) {
+        return send_error_response(req, "409 Conflict", "ota_not_available", "partition table has no OTA slot");
+    }
+    if (req->content_len == 0) {
+        return send_error_response(req, "400 Bad Request", "empty_firmware");
+    }
+    if (req->content_len > update_partition->size) {
+        return send_error_response(req, "413 Payload Too Large", "firmware_too_large");
+    }
+
+    ota_state_started(update_partition, req->content_len);
+    char event_data[128];
+    snprintf(event_data, sizeof(event_data), "{\"partition\":\"%s\",\"bytes\":%u}",
+             update_partition->label, (unsigned)req->content_len);
+    app_events_log("http", "warn", "ota_started", "OTA update started", event_data, true);
+
+    uint8_t *buffer = static_cast<uint8_t *>(malloc(OTA_UPLOAD_BUFFER_SIZE));
+    if (!buffer) {
+        ota_state_finished(false, ESP_ERR_NO_MEM, nullptr);
+        app_events_log("http", "error", "ota_failed", "OTA update failed", "{\"result\":\"ESP_ERR_NO_MEM\"}", true);
+        return send_error_response(req, "500 Internal Server Error", "out_of_memory");
+    }
+
+    esp_ota_handle_t ota_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
+    bool handle_open = err == ESP_OK;
+    size_t remaining = req->content_len;
+    size_t written = 0;
+    int timeouts = 0;
+
+    while (err == ESP_OK && remaining > 0) {
+        size_t to_read = remaining < OTA_UPLOAD_BUFFER_SIZE ? remaining : OTA_UPLOAD_BUFFER_SIZE;
+        int received = httpd_req_recv(req, reinterpret_cast<char *>(buffer), to_read);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts > 20) {
+                err = ESP_ERR_TIMEOUT;
+            }
+            continue;
+        }
+        if (received <= 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        timeouts = 0;
+        err = esp_ota_write(ota_handle, buffer, (size_t)received);
+        if (err != ESP_OK) {
+            break;
+        }
+        written += (size_t)received;
+        remaining -= (size_t)received;
+        ota_state_progress(written);
+    }
+
+    free(buffer);
+
+    if (err == ESP_OK) {
+        err = esp_ota_end(ota_handle);
+        handle_open = false;
+    }
+    if (err != ESP_OK) {
+        if (handle_open) {
+            (void)esp_ota_abort(ota_handle);
+        }
+        snprintf(event_data, sizeof(event_data), "{\"result\":\"%s\",\"written\":%u}",
+                 esp_err_to_name(err), (unsigned)written);
+        ota_state_finished(false, err, nullptr);
+        app_events_log("http", "error", "ota_failed", "OTA update failed", event_data, true);
+        return send_error_response(req, "400 Bad Request", "ota_write_failed", esp_err_to_name(err));
+    }
+
+    esp_app_desc_t new_app = {};
+    const char *new_version = "";
+    if (esp_ota_get_partition_description(update_partition, &new_app) == ESP_OK) {
+        new_version = new_app.version;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        snprintf(event_data, sizeof(event_data), "{\"result\":\"%s\",\"partition\":\"%s\"}",
+                 esp_err_to_name(err), update_partition->label);
+        ota_state_finished(false, err, new_version);
+        app_events_log("http", "error", "ota_failed", "OTA update failed", event_data, true);
+        return send_error_response(req, "500 Internal Server Error", "ota_boot_partition_failed", esp_err_to_name(err));
+    }
+
+    ota_state_finished(true, ESP_OK, new_version);
+    snprintf(event_data, sizeof(event_data), "{\"partition\":\"%s\",\"bytes\":%u}",
+             update_partition->label, (unsigned)written);
+    app_events_log("http", "warn", "ota_succeeded", "OTA update installed", event_data, true);
+
+    std::string json;
+    json.reserve(192);
+    json += "{\"ok\":true,\"bytes\":";
+    json += std::to_string(written);
+    json += ",\"partition\":";
+    json_string_value(json, update_partition->label);
+    json += ",\"version\":";
+    json_string_value(json, new_version);
+    json += ",\"reboot_ms\":";
+    json += std::to_string(OTA_REBOOT_DELAY_MS);
+    json += '}';
+    esp_err_t send_err = send_json_response(req, json);
+    vTaskDelay(pdMS_TO_TICKS(OTA_REBOOT_DELAY_MS));
+    esp_restart();
+    return send_err;
+}
+
 static esp_err_t events_clear_post_handler(httpd_req_t *req) {
     if (!require_admin(req)) {
         return ESP_OK;
@@ -929,6 +1263,9 @@ static esp_err_t app_register_http_handlers(httpd_handle_t server) {
 
     ESP_RETURN_ON_ERROR(register_uri("/api/access", HTTP_GET, access_get_handler), TAG, "access API");
     ESP_RETURN_ON_ERROR(register_uri("/api/status", HTTP_GET, status_get_handler), TAG, "status API");
+    ESP_RETURN_ON_ERROR(register_uri("/ota", HTTP_GET, ota_page_get_handler), TAG, "OTA page");
+    ESP_RETURN_ON_ERROR(register_uri("/api/ota", HTTP_GET, ota_get_handler), TAG, "OTA status API");
+    ESP_RETURN_ON_ERROR(register_uri("/api/ota", HTTP_POST, ota_post_handler), TAG, "OTA upload API");
     ESP_RETURN_ON_ERROR(register_uri("/api/events", HTTP_GET, events_get_handler), TAG, "events API");
     ESP_RETURN_ON_ERROR(register_uri("/api/events/clear", HTTP_POST, events_clear_post_handler), TAG, "events clear API");
     ESP_RETURN_ON_ERROR(register_uri("/api/admin/setup", HTTP_POST, admin_setup_post_handler), TAG, "admin setup API");

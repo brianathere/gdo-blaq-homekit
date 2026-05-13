@@ -22,6 +22,7 @@ Read-only APIs:
 - `GET /api/status`
 - `GET /api/events?limit=50&category=&severity=`
 - `GET /api/settings`
+- `GET /api/ota`
 - `GET /api/homekit/setup`
 - `GET /api/homekit/setup-qr.svg`
 - `POST /api/gdo/refresh`
@@ -34,6 +35,15 @@ Mutating APIs require an admin PIN in the `X-Admin-PIN` header:
 - `POST /api/settings`
 - `POST /api/gdo/sync`
 - `POST /api/gdo/position`
+- `POST /api/ota`
+
+The firmware also serves a small OTA upload page at `http://<device-ip>:8080/ota`. The first OTA-capable build still has to be flashed over USB because it changes the partition table. After that, upload `build/gdo-blaq-homekit.bin` through `/ota` or run:
+
+```sh
+GDO_ADMIN_PIN=<web-admin-password> python tests/ota_update.py \
+  --base-url http://<device-ip>:8080 \
+  --bin build/gdo-blaq-homekit.bin
+```
 
  After connecting to WiFi and restarting wait about 10 seconds then open the Home app on your iOS device to add the accessory. Go to "Add Accessory" and then "more options..." to find the accessory on the network. Click on the found accessory and enter the setup code `251-02-023` when prompted and follow the instructions to complete the setup.
 

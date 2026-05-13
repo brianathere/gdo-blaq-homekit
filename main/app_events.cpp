@@ -153,6 +153,9 @@ enum : uint16_t {
     EVENT_CODE_AP_CLIENT_CONNECTED,
     EVENT_CODE_AP_CLIENT_DISCONNECTED,
     EVENT_CODE_PARTIAL_OPEN_REJECTED,
+    EVENT_CODE_OTA_STARTED,
+    EVENT_CODE_OTA_SUCCEEDED,
+    EVENT_CODE_OTA_FAILED,
 };
 
 static const id_name_t CATEGORY_NAMES[] = {
@@ -217,6 +220,9 @@ static const code_meta_t CODE_META[] = {
     {EVENT_CODE_AP_CLIENT_CONNECTED, "ap_client_connected", "SoftAP client connected"},
     {EVENT_CODE_AP_CLIENT_DISCONNECTED, "ap_client_disconnected", "SoftAP client disconnected"},
     {EVENT_CODE_PARTIAL_OPEN_REJECTED, "partial_open_rejected", "Partial-open request rejected"},
+    {EVENT_CODE_OTA_STARTED, "ota_started", "OTA update started"},
+    {EVENT_CODE_OTA_SUCCEEDED, "ota_succeeded", "OTA update installed"},
+    {EVENT_CODE_OTA_FAILED, "ota_failed", "OTA update failed"},
 };
 
 static const id_name_t REASON_NAMES[] = {
