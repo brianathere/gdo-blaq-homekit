@@ -260,10 +260,16 @@ def probe_http(url: str, timeout: float) -> None:
         raise SmokeFailure("HTTP probe succeeded but response did not look like the device status page")
 
 
-def probe_status_api(base_url: str, timeout: float) -> None:
+def api_auth_headers(admin_pin: str | None) -> dict[str, str]:
+    return {"X-Admin-PIN": admin_pin} if admin_pin else {}
+
+
+def probe_status_api(base_url: str, timeout: float, admin_pin: str | None) -> None:
     status_url = urllib.parse.urljoin(base_url, "/api/status")
     print(f"Probing {status_url}...", flush=True)
-    request = urllib.request.Request(status_url, headers={"User-Agent": "gdo-blaq-homekit-smoke/1.0"})
+    headers = {"User-Agent": "gdo-blaq-homekit-smoke/1.0"}
+    headers.update(api_auth_headers(admin_pin))
+    request = urllib.request.Request(status_url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read(16384)
         status = getattr(response, "status", response.getcode())
@@ -314,7 +320,7 @@ def probe_management_apis(base_url: str, timeout: float, admin_pin: str | None) 
     for name, path in endpoints.items():
         url = urllib.parse.urljoin(base_url, path)
         print(f"Probing {url}...", flush=True)
-        status, data = http_json("GET", url, timeout)
+        status, data = http_json("GET", url, timeout, headers=api_auth_headers(admin_pin))
         if status != 200:
             raise SmokeFailure(f"{name} API returned status {status}")
         if name == "events" and "events" not in data:
@@ -339,11 +345,11 @@ def probe_management_apis(base_url: str, timeout: float, admin_pin: str | None) 
         return
 
     settings_url = urllib.parse.urljoin(base_url, "/api/settings")
-    status, settings = http_json("GET", settings_url, timeout)
+    headers = {"X-Admin-PIN": admin_pin}
+    status, settings = http_json("GET", settings_url, timeout, headers=headers)
     if status != 200:
         raise SmokeFailure("settings API unavailable before admin PIN check")
 
-    headers = {"X-Admin-PIN": admin_pin}
     if not settings.get("admin", {}).get("pin_configured"):
         setup_url = urllib.parse.urljoin(base_url, "/api/admin/setup")
         print(f"Creating admin PIN through {setup_url}...", flush=True)
@@ -418,7 +424,7 @@ def main() -> int:
         state = monitor_boot(args, port)
         if args.probe_url:
             probe_http(args.probe_url, args.probe_timeout)
-            probe_status_api(args.probe_url, args.probe_timeout)
+            probe_status_api(args.probe_url, args.probe_timeout, args.admin_pin)
             probe_management_apis(args.probe_url, args.probe_timeout, args.admin_pin)
 
         wifi_mode = "ap" if state.ap_ready else "sta" if state.sta_ready else "unknown"
