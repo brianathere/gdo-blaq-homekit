@@ -659,13 +659,14 @@ static esp_err_t require_web_access(httpd_req_t *req) {
     return web_access_allowed(req) ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
-static void set_admin_cookie(httpd_req_t *req, const char *pin) {
+static void set_admin_cookie(httpd_req_t *req, const char *pin, std::string &cookie) {
     if (!req || !pin || !pin[0]) {
         return;
     }
-    char cookie[128];
-    snprintf(cookie, sizeof(cookie), "gdo_admin_pin=%s; Path=/; SameSite=Strict; HttpOnly", pin);
-    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+    cookie = "gdo_admin_pin=";
+    cookie += pin;
+    cookie += "; Path=/; SameSite=Strict; HttpOnly";
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie.c_str());
 }
 
 static bool require_admin(httpd_req_t *req, const std::string *body = nullptr) {
@@ -995,7 +996,8 @@ static esp_err_t admin_setup_post_handler(httpd_req_t *req) {
     if (err != ESP_OK) {
         return send_error_response(req, "400 Bad Request", "invalid_password", esp_err_to_name(err));
     }
-    set_admin_cookie(req, pin);
+    std::string cookie;
+    set_admin_cookie(req, pin, cookie);
     return send_json_response(req, "{\"ok\":true,\"password_configured\":true}");
 }
 
@@ -1011,7 +1013,9 @@ static esp_err_t admin_check_post_handler(httpd_req_t *req) {
     char pin[ADMIN_PIN_BUFFER_SIZE] = {};
     if (get_admin_pin_from_request(req, pin, sizeof(pin)) ||
         get_admin_pin_from_body(body, pin, sizeof(pin))) {
-        set_admin_cookie(req, pin);
+        std::string cookie;
+        set_admin_cookie(req, pin, cookie);
+        return send_json_response(req, "{\"ok\":true,\"authenticated\":true}");
     }
     return send_json_response(req, "{\"ok\":true,\"authenticated\":true}");
 }
